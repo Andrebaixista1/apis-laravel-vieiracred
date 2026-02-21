@@ -11,6 +11,13 @@ Projeto Laravel para APIs da VieiraCred.
     - `sqlsrv_servidor_planejamento`
   - Executa `SELECT 1` em cada conexão e retorna status (`up`/`down`) com latência e erro (quando houver).
 
+- `GET /api/consulta-v8/run`
+  - Executa 1 ciclo manual de consulta V8 (sem loop).
+  - Busca logins em `[consultas_v8].[dbo].[limites_v8]` e aplica limite por login (`consultados < total`).
+  - Se o limite zerar, reseta `consultados` após 1 hora de `updated_at`.
+  - Busca clientes pendentes em `[consultas_v8].[dbo].[consulta_v8]`.
+  - Processa consulta na V8, faz `MERGE` no banco e espera 5s entre clientes.
+
 ## Como rodar
 
 1. Instale as dependências:

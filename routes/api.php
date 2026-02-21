@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\ConsultaV8Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
@@ -53,3 +54,5 @@ Route::get('/db-health', function () {
         'results' => $results,
     ]);
 });
+
+Route::get('/consulta-v8/run', [ConsultaV8Controller::class, 'run']);
