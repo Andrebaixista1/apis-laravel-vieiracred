@@ -56,3 +56,7 @@ Route::get('/db-health', function () {
 });
 
 Route::get('/consulta-v8/run', [ConsultaV8Controller::class, 'run']);
+
+Route::post('/consulta-v8', [ConsultaV8Controller::class, 'store']);
+Route::get('/consulta-v8/limites', [ConsultaV8Controller::class, 'listLimites']);
+Route::get('/consulta-v8/consultas', [ConsultaV8Controller::class, 'listConsultas']);

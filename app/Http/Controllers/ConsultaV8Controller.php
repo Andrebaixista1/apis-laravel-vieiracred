@@ -20,10 +20,14 @@ class ConsultaV8Controller extends Controller
     private const PROVIDER_DEFAULT = 'QI';
     private const HTTP_TIMEOUT_SECONDS = 30;
     private const FINAL_GET_MAX_ATTEMPTS = 5;
+    private const DEFAULT_CLIENT_BIRTH_DATE = '1996-05-15';
+    private const DEFAULT_CLIENT_SEX = 'male';
+    private const DEFAULT_CLIENT_STATUS = 'pendente';
     private const RETRYABLE_V8_STATUSES = [
         'WAITING_CONSENT',
         'WAITING_CONSULT',
         'WAITING_CREDIT_ANALYSIS',
+        'CONSENT_APPROVED',
     ];
 
     public function run(Request $request): JsonResponse
@@ -138,6 +142,168 @@ class ConsultaV8Controller extends Controller
         } finally {
             optional($lock)->release();
         }
+    }
+
+
+    public function store(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'cliente_cpf' => ['required', 'string', 'max:20'],
+            'cliente_nome' => ['required', 'string', 'max:255'],
+            'nascimento' => ['nullable', 'date'],
+            'telefone' => ['nullable', 'string', 'max:20'],
+            'id_user' => ['required', 'integer'],
+            'id_equipe' => ['required', 'integer'],
+            'id_role' => ['required', 'integer'],
+            'cliente_sexo' => ['nullable', 'string', 'max:20'],
+            'email' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $cpf = preg_replace('/\D+/', '', (string) $validated['cliente_cpf']);
+        $nome = $this->normalizeClientName((string) $validated['cliente_nome']);
+
+        if ($cpf === '' || $nome === '') {
+            return response()->json([
+                'ok' => false,
+                'message' => 'cliente_cpf e cliente_nome sao obrigatorios.',
+            ], 422);
+        }
+
+        $nascimento = $this->toBirthDate($validated['nascimento'] ?? null);
+        if ($nascimento === '') {
+            $nascimento = self::DEFAULT_CLIENT_BIRTH_DATE;
+        }
+
+        $telefoneDigits = preg_replace('/\D+/', '', (string) ($validated['telefone'] ?? ''));
+        $isPhoneValid = strlen($telefoneDigits) === 11
+            && substr($telefoneDigits, 2, 1) === '9'
+            && $telefoneDigits >= '11911111111'
+            && $telefoneDigits <= '99999999999';
+
+        if (! $isPhoneValid) {
+            $telefoneDigits = $this->generateRandomPhoneNumber();
+        }
+
+        $clienteSexo = trim((string) ($validated['cliente_sexo'] ?? self::DEFAULT_CLIENT_SEX));
+        if ($clienteSexo === '') {
+            $clienteSexo = self::DEFAULT_CLIENT_SEX;
+        }
+
+        $email = $this->toNullableString($validated['email'] ?? null);
+        if ($email === null) {
+            $email = 'naotem@gmail.com';
+        }
+
+        $payload = [
+            'cliente_cpf' => $cpf,
+            'cliente_sexo' => $clienteSexo,
+            'nascimento' => $nascimento,
+            'cliente_nome' => $nome,
+            'email' => $email,
+            'telefone' => $telefoneDigits,
+            'status' => self::DEFAULT_CLIENT_STATUS,
+            'id_user' => (int) $validated['id_user'],
+            'id_equipe' => (int) $validated['id_equipe'],
+            'id_roles' => (int) $validated['id_role'],
+        ];
+
+        $inserted = DB::connection('sqlsrv_kinghost_vps')->selectOne("
+            INSERT INTO [consultas_v8].[dbo].[consulta_v8] (
+                [cliente_cpf],
+                [cliente_sexo],
+                [nascimento],
+                [cliente_nome],
+                [email],
+                [telefone],
+                [created_at],
+                [status],
+                [status_consulta_v8],
+                [valor_liberado],
+                [descricao_v8],
+                [id_user],
+                [id_equipe],
+                [id_roles]
+            )
+            OUTPUT INSERTED.[id] AS [id]
+            VALUES (?, ?, ?, ?, ?, ?, SYSDATETIME(), ?, NULL, NULL, NULL, ?, ?, ?);
+        ", [
+            $payload['cliente_cpf'],
+            $payload['cliente_sexo'],
+            $payload['nascimento'],
+            $payload['cliente_nome'],
+            $payload['email'],
+            $payload['telefone'],
+            $payload['status'],
+            $payload['id_user'],
+            $payload['id_equipe'],
+            $payload['id_roles'],
+        ]);
+
+        return response()->json([
+            'ok' => true,
+            'message' => 'Cliente enfileirado para consulta V8.',
+            'data' => [
+                'id' => (int) ($inserted->id ?? 0),
+                'cliente_cpf' => $payload['cliente_cpf'],
+                'cliente_nome' => $payload['cliente_nome'],
+                'status' => $payload['status'],
+                'created_at' => now()->toIso8601String(),
+            ],
+        ], 201);
+    }
+
+
+    public function listLimites(Request $request): JsonResponse
+    {
+        $rows = DB::connection('sqlsrv_kinghost_vps')->select("
+            SELECT TOP (1000)
+                [id],
+                [email],
+                [senha],
+                [total],
+                [consultados],
+                [limite],
+                [created_at],
+                [updated_at]
+            FROM [consultas_v8].[dbo].[limites_v8]
+            ORDER BY [id] DESC
+        ");
+
+        return response()->json([
+            'ok' => true,
+            'total' => count($rows),
+            'data' => $rows,
+        ]);
+    }
+
+    public function listConsultas(Request $request): JsonResponse
+    {
+        $rows = DB::connection('sqlsrv_kinghost_vps')->select("
+            SELECT TOP (1000)
+                [id],
+                [cliente_cpf],
+                [cliente_sexo],
+                [nascimento],
+                [cliente_nome],
+                [email],
+                [telefone],
+                [created_at],
+                [status],
+                [status_consulta_v8],
+                [valor_liberado],
+                [descricao_v8],
+                [id_user],
+                [id_equipe],
+                [id_roles]
+            FROM [consultas_v8].[dbo].[consulta_v8]
+            ORDER BY [id] DESC
+        ");
+
+        return response()->json([
+            'ok' => true,
+            'total' => count($rows),
+            'data' => $rows,
+        ]);
     }
 
     private function loadAccountsWithAvailableLimit(): array
@@ -691,6 +857,30 @@ class ConsultaV8Controller extends Controller
         ];
     }
 
+
+
+    private function generateRandomPhoneNumber(): string
+    {
+        $ddd = (string) random_int(11, 99);
+        $subscriber = str_pad((string) random_int(11111111, 99999999), 8, '0', STR_PAD_LEFT);
+
+        return $ddd.'9'.$subscriber;
+    }
+
+
+    private function normalizeClientName(string $value): string
+    {
+        $name = trim($value);
+        if ($name === '') {
+            return '';
+        }
+
+        $name = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $name) ?: $name;
+        $name = preg_replace('/[^A-Za-z0-9\s]/', '', $name) ?? $name;
+        $name = preg_replace('/\s+/', ' ', $name) ?? $name;
+
+        return mb_strtoupper(trim($name), 'UTF-8');
+    }
     private function parseMarginValue($raw): ?float
     {
         if ($raw === null || $raw === '') {
