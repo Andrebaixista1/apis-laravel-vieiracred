@@ -23,6 +23,7 @@ class ConsultaV8Controller extends Controller
     private const DEFAULT_CLIENT_BIRTH_DATE = '1996-05-15';
     private const DEFAULT_CLIENT_SEX = 'male';
     private const DEFAULT_CLIENT_STATUS = 'pendente';
+    private const HOLD_CLIENT_STATUS = 'adicionando';
     private const RETRYABLE_V8_STATUSES = [
         'WAITING_CONSENT',
         'WAITING_CONSULT',
@@ -147,125 +148,193 @@ class ConsultaV8Controller extends Controller
 
     public function store(Request $request): JsonResponse
     {
-        $validated = $request->validate([
-            'cliente_cpf' => ['required', 'string', 'max:20'],
-            'cliente_nome' => ['required', 'string', 'max:255'],
-            'nascimento' => ['nullable', 'date'],
-            'telefone' => ['nullable', 'string', 'max:20'],
-            'id_user' => ['required', 'integer'],
-            'id_equipe' => ['required', 'integer'],
-            'id_role' => ['required', 'integer'],
-            'cliente_sexo' => ['nullable', 'string', 'max:20'],
-            'email' => ['nullable', 'string', 'max:255'],
-            'tipoConsulta' => ['nullable', 'string', 'max:255'],
-        ]);
+        $batchRows = $this->extractBatchRowsFromRequest($request);
 
-        $cpf = preg_replace('/\D+/', '', (string) $validated['cliente_cpf']);
-        $nome = $this->normalizeClientName((string) $validated['cliente_nome']);
+        if ($batchRows !== null) {
+            if (empty($batchRows)) {
+                return response()->json([
+                    'ok' => false,
+                    'message' => 'Informe pelo menos uma linha no lote.',
+                ], 422);
+            }
 
-        if ($cpf === '' || $nome === '') {
+            if (count($batchRows) > 5000) {
+                return response()->json([
+                    'ok' => false,
+                    'message' => 'Lote acima do limite permitido de 5000 linhas por requisicao.',
+                ], 422);
+            }
+
+            $defaults = [
+                'id_user' => $request->input('id_user'),
+                'id_equipe' => $request->input('id_equipe'),
+                'id_role' => $request->input('id_role', $request->input('id_roles')),
+                'cliente_sexo' => $request->input('cliente_sexo'),
+                'email' => $request->input('email'),
+                'tipoConsulta' => $request->input('tipoConsulta'),
+                'hold_pending' => $request->input('hold_pending'),
+            ];
+
+            $payloads = [];
+            foreach ($batchRows as $index => $row) {
+                if (! is_array($row)) {
+                    return response()->json([
+                        'ok' => false,
+                        'message' => 'Linha '.($index + 1).' invalida: formato de objeto esperado.',
+                    ], 422);
+                }
+
+                try {
+                    $payloads[] = $this->buildStorePayloadFromInput($row, $defaults);
+                } catch (\InvalidArgumentException $e) {
+                    return response()->json([
+                        'ok' => false,
+                        'message' => 'Linha '.($index + 1).': '.$e->getMessage(),
+                    ], 422);
+                }
+            }
+
+            $insertedIds = $this->insertConsultaRows($payloads);
+            $holdPendingCount = count(array_filter(
+                $payloads,
+                static fn (array $payload): bool => $payload['status'] === self::HOLD_CLIENT_STATUS
+            ));
+
+            return response()->json([
+                'ok' => true,
+                'message' => 'Lote enfileirado para consulta V8.',
+                'data' => [
+                    'mode' => 'batch',
+                    'inserted_count' => count($insertedIds),
+                    'hold_pending_count' => $holdPendingCount,
+                    'pendente_count' => count($insertedIds) - $holdPendingCount,
+                    'ids' => $insertedIds,
+                    'created_at' => now()->toIso8601String(),
+                ],
+            ], 201);
+        }
+
+        try {
+            $payload = $this->buildStorePayloadFromInput($request->all());
+        } catch (\InvalidArgumentException $e) {
             return response()->json([
                 'ok' => false,
-                'message' => 'cliente_cpf e cliente_nome sao obrigatorios.',
+                'message' => $e->getMessage(),
             ], 422);
         }
 
-        $nascimento = $this->toBirthDate($validated['nascimento'] ?? null);
-        if ($nascimento === '') {
-            $nascimento = self::DEFAULT_CLIENT_BIRTH_DATE;
-        }
-
-        $telefoneDigits = preg_replace('/\D+/', '', (string) ($validated['telefone'] ?? ''));
-        $isPhoneValid = strlen($telefoneDigits) === 11
-            && substr($telefoneDigits, 2, 1) === '9'
-            && $telefoneDigits >= '11911111111'
-            && $telefoneDigits <= '99999999999';
-
-        if (! $isPhoneValid) {
-            $telefoneDigits = $this->generateRandomPhoneNumber();
-        }
-
-        $clienteSexo = trim((string) ($validated['cliente_sexo'] ?? self::DEFAULT_CLIENT_SEX));
-        if ($clienteSexo === '') {
-            $clienteSexo = self::DEFAULT_CLIENT_SEX;
-        }
-
-        $email = $this->toNullableString($validated['email'] ?? null);
-        if ($email === null) {
-            $email = 'naotem@gmail.com';
-        }
-
-        $tipoConsulta = trim((string) ($validated['tipoConsulta'] ?? 'Individual'));
-        if ($tipoConsulta === '') {
-            $tipoConsulta = 'Individual';
-        }
-
-        $payload = [
-            'cliente_cpf' => $cpf,
-            'cliente_sexo' => $clienteSexo,
-            'nascimento' => $nascimento,
-            'cliente_nome' => $nome,
-            'email' => $email,
-            'telefone' => $telefoneDigits,
-            'status' => self::DEFAULT_CLIENT_STATUS,
-            'tipoConsulta' => mb_substr($tipoConsulta, 0, 255),
-            'id_user' => (int) $validated['id_user'],
-            'id_equipe' => (int) $validated['id_equipe'],
-            'id_roles' => (int) $validated['id_role'],
-        ];
-
-        $inserted = DB::connection('sqlsrv_kinghost_vps')->selectOne("
-            INSERT INTO [consultas_v8].[dbo].[consulta_v8] (
-                [cliente_cpf],
-                [cliente_sexo],
-                [nascimento],
-                [cliente_nome],
-                [email],
-                [telefone],
-                [created_at],
-                [status],
-                [status_consulta_v8],
-                [valor_liberado],
-                [descricao_v8],
-                [tipoConsulta],
-                [id_user],
-                [id_equipe],
-                [id_roles]
-            )
-            OUTPUT INSERTED.[id] AS [id]
-            VALUES (?, ?, ?, ?, ?, ?, SYSDATETIME(), ?, NULL, NULL, NULL, ?, ?, ?, ?);
-        ", [
-            $payload['cliente_cpf'],
-            $payload['cliente_sexo'],
-            $payload['nascimento'],
-            $payload['cliente_nome'],
-            $payload['email'],
-            $payload['telefone'],
-            $payload['status'],
-            $payload['tipoConsulta'],
-            $payload['id_user'],
-            $payload['id_equipe'],
-            $payload['id_roles'],
-        ]);
+        $insertedIds = $this->insertConsultaRows([$payload]);
+        $insertedId = (int) ($insertedIds[0] ?? 0);
+        $holdPending = $payload['status'] === self::HOLD_CLIENT_STATUS;
 
         return response()->json([
             'ok' => true,
             'message' => 'Cliente enfileirado para consulta V8.',
             'data' => [
-                'id' => (int) ($inserted->id ?? 0),
+                'id' => $insertedId,
                 'cliente_cpf' => $payload['cliente_cpf'],
                 'cliente_nome' => $payload['cliente_nome'],
                 'status' => $payload['status'],
                 'tipoConsulta' => $payload['tipoConsulta'],
+                'hold_pending' => $holdPending,
                 'created_at' => now()->toIso8601String(),
             ],
         ], 201);
+    }
+
+    public function releasePendingByScope(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'id_user' => ['required', 'integer'],
+            'id_equipe' => ['required', 'integer'],
+            'tipoConsulta' => ['nullable', 'string', 'max:255'],
+            'ids' => ['nullable', 'array'],
+            'ids.*' => ['integer', 'min:1'],
+        ]);
+
+        $idUser = (int) $validated['id_user'];
+        $idEquipe = (int) $validated['id_equipe'];
+        $tipoConsulta = trim((string) ($validated['tipoConsulta'] ?? ''));
+        $ids = array_values(array_unique(array_map(
+            static fn ($id) => (int) $id,
+            array_filter($validated['ids'] ?? [], static fn ($id) => (int) $id > 0)
+        )));
+
+        if (empty($ids) && $tipoConsulta === '') {
+            return response()->json([
+                'ok' => false,
+                'message' => 'Informe ids ou tipoConsulta para liberar pendentes.',
+            ], 422);
+        }
+
+        $where = [
+            '[id_user] = ?',
+            '[id_equipe] = ?',
+        ];
+        $bindings = [$idUser, $idEquipe];
+
+        if (! empty($ids)) {
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $where[] = "[id] IN ($placeholders)";
+            $bindings = array_merge($bindings, $ids);
+        } else {
+            $where[] = '[tipoConsulta] = ?';
+            $bindings[] = $tipoConsulta;
+        }
+
+        $whereSql = implode(' AND ', $where);
+        $released = 0;
+        $connection = DB::connection('sqlsrv_kinghost_vps');
+
+        if (! empty($ids)) {
+            foreach (array_chunk($ids, 1000) as $idsChunk) {
+                $chunkWhere = [
+                    '[id_user] = ?',
+                    '[id_equipe] = ?',
+                ];
+                $chunkBindings = [$idUser, $idEquipe];
+
+                $chunkPlaceholders = implode(',', array_fill(0, count($idsChunk), '?'));
+                $chunkWhere[] = "[id] IN ($chunkPlaceholders)";
+                $chunkBindings = array_merge($chunkBindings, $idsChunk);
+
+                $chunkWhereSql = implode(' AND ', $chunkWhere);
+                $released += (int) $connection->update("
+                    UPDATE [consultas_v8].[dbo].[consulta_v8]
+                    SET [status] = ?
+                    WHERE $chunkWhereSql
+                      AND UPPER(LTRIM(RTRIM(COALESCE([status], '')))) IN ('ADICIONANDO', 'EM INSERCAO', 'EM_INSERCAO', 'AGUARDANDO INSERCAO', 'AGUARDANDO_INSERCAO')
+                ", array_merge([self::DEFAULT_CLIENT_STATUS], $chunkBindings));
+            }
+        } else {
+            $released = (int) $connection->update("
+                UPDATE [consultas_v8].[dbo].[consulta_v8]
+                SET [status] = ?
+                WHERE $whereSql
+                  AND UPPER(LTRIM(RTRIM(COALESCE([status], '')))) IN ('ADICIONANDO', 'EM INSERCAO', 'EM_INSERCAO', 'AGUARDANDO INSERCAO', 'AGUARDANDO_INSERCAO')
+            ", array_merge([self::DEFAULT_CLIENT_STATUS], $bindings));
+        }
+
+        return response()->json([
+            'ok' => true,
+            'message' => $released > 0
+                ? 'Registros liberados para pendente.'
+                : 'Nenhum registro em status de insercao encontrado para liberar.',
+            'released_count' => (int) $released,
+            'filters' => [
+                'id_user' => $idUser,
+                'id_equipe' => $idEquipe,
+                'tipoConsulta' => $tipoConsulta !== '' ? $tipoConsulta : null,
+                'ids' => $ids,
+            ],
+        ]);
     }
 
 
     public function listLimites(Request $request): JsonResponse
     {
         $userId = $this->toNullableInt($request->query('id_user'));
+        $equipeId = $this->toNullableInt($request->query('id_equipe'));
 
         $rows = DB::connection('sqlsrv_kinghost_vps')->select("
             SELECT TOP (1000)
@@ -283,7 +352,7 @@ class ConsultaV8Controller extends Controller
 
         $rows = array_map(static fn($row) => (array) $row, $rows);
 
-        $filtered = $this->filterAccountsForUser($rows, $userId);
+        $filtered = $this->filterAccountsForUser($rows, $userId, $equipeId);
 
         return response()->json([
             'ok' => true,
@@ -369,15 +438,15 @@ class ConsultaV8Controller extends Controller
 
     public function deleteConsultasByLote(Request $request): JsonResponse
     {
-        $validated = $request->validate([
-            'id_user' => ['required', 'integer'],
-            'id_equipe' => ['required', 'integer'],
-            'tipoConsulta' => ['required', 'string', 'max:255'],
-        ]);
+        $requesterUserId = $this->toNullableInt($request->input('id_user'));
+        $tipoConsulta = trim((string) $request->input('tipoConsulta', ''));
 
-        $idUser = (int) $validated['id_user'];
-        $idEquipe = (int) $validated['id_equipe'];
-        $tipoConsulta = trim((string) $validated['tipoConsulta']);
+        if ($requesterUserId === null || $requesterUserId <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_user invalido.',
+            ], 422);
+        }
 
         if ($tipoConsulta === '') {
             return response()->json([
@@ -386,12 +455,56 @@ class ConsultaV8Controller extends Controller
             ], 422);
         }
 
+        $targetUserId = $this->toNullableInt($request->input('target_id_user'));
+        $targetEquipeId = $this->toNullableInt($request->input('target_id_equipe'));
+
+        if ($requesterUserId === 1) {
+            $where = ['[tipoConsulta] = ?'];
+            $bindings = [$tipoConsulta];
+
+            if ($targetUserId !== null && $targetUserId > 0) {
+                $where[] = '[id_user] = ?';
+                $bindings[] = $targetUserId;
+            }
+            if ($targetEquipeId !== null && $targetEquipeId > 0) {
+                $where[] = '[id_equipe] = ?';
+                $bindings[] = $targetEquipeId;
+            }
+
+            $deleted = DB::connection('sqlsrv_kinghost_vps')->delete("
+                DELETE FROM [consultas_v8].[dbo].[consulta_v8]
+                WHERE ".implode(' AND ', $where)."
+            ", $bindings);
+
+            return response()->json([
+                'ok' => true,
+                'message' => $deleted > 0
+                    ? 'Lote removido com sucesso.'
+                    : 'Nenhum registro encontrado para os filtros informados.',
+                'deleted_count' => (int) $deleted,
+                'filters' => [
+                    'requester_id_user' => $requesterUserId,
+                    'target_id_user' => $targetUserId,
+                    'target_id_equipe' => $targetEquipeId,
+                    'tipoConsulta' => $tipoConsulta,
+                ],
+            ]);
+        }
+
+        $idEquipe = $this->toNullableInt($request->input('id_equipe'));
+        if ($idEquipe === null || $idEquipe <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_equipe invalido.',
+            ], 422);
+        }
+
         $deleted = DB::connection('sqlsrv_kinghost_vps')->delete("
             DELETE FROM [consultas_v8].[dbo].[consulta_v8]
             WHERE [id_user] = ?
               AND [id_equipe] = ?
               AND [tipoConsulta] = ?
-        ", [$idUser, $idEquipe, $tipoConsulta]);
+        ", [$requesterUserId, $idEquipe, $tipoConsulta]);
 
         return response()->json([
             'ok' => true,
@@ -400,11 +513,196 @@ class ConsultaV8Controller extends Controller
                 : 'Nenhum registro encontrado para os filtros informados.',
             'deleted_count' => (int) $deleted,
             'filters' => [
-                'id_user' => $idUser,
+                'id_user' => $requesterUserId,
                 'id_equipe' => $idEquipe,
                 'tipoConsulta' => $tipoConsulta,
             ],
         ]);
+    }
+
+    private function extractBatchRowsFromRequest(Request $request): ?array
+    {
+        $rows = $request->input('rows');
+        if (is_array($rows)) {
+            return $rows;
+        }
+
+        $items = $request->input('items');
+        if (is_array($items)) {
+            return $items;
+        }
+
+        $data = $request->input('data');
+        if (is_array($data) && array_is_list($data)) {
+            return $data;
+        }
+
+        $all = $request->all();
+        if (is_array($all) && array_is_list($all)) {
+            return $all;
+        }
+
+        return null;
+    }
+
+    private function buildStorePayloadFromInput(array $input, array $defaults = []): array
+    {
+        $cpfRaw = $input['cliente_cpf'] ?? $input['cpf'] ?? $defaults['cliente_cpf'] ?? $defaults['cpf'] ?? '';
+        $nomeRaw = $input['cliente_nome'] ?? $input['nome'] ?? $defaults['cliente_nome'] ?? $defaults['nome'] ?? '';
+        $idUserRaw = $input['id_user'] ?? $defaults['id_user'] ?? null;
+        $idEquipeRaw = $input['id_equipe'] ?? $input['equipe_id'] ?? $defaults['id_equipe'] ?? $defaults['equipe_id'] ?? null;
+        $idRoleRaw = $input['id_role'] ?? $input['id_roles'] ?? $defaults['id_role'] ?? $defaults['id_roles'] ?? null;
+
+        $cpf = preg_replace('/\D+/', '', (string) $cpfRaw);
+        $nome = $this->normalizeClientName((string) $nomeRaw);
+        $idUser = $this->toNullableInt($idUserRaw);
+        $idEquipe = $this->toNullableInt($idEquipeRaw);
+        $idRole = $this->toNullableInt($idRoleRaw);
+
+        if ($cpf === '') {
+            throw new \InvalidArgumentException('cliente_cpf e obrigatorio.');
+        }
+
+        if ($nome === '') {
+            throw new \InvalidArgumentException('cliente_nome e obrigatorio.');
+        }
+
+        if ($idUser === null || $idUser <= 0) {
+            throw new \InvalidArgumentException('id_user e obrigatorio.');
+        }
+
+        if ($idEquipe === null || $idEquipe <= 0) {
+            throw new \InvalidArgumentException('id_equipe e obrigatorio.');
+        }
+
+        if ($idRole === null || $idRole <= 0) {
+            throw new \InvalidArgumentException('id_role e obrigatorio.');
+        }
+
+        $nascimento = $this->toBirthDate($input['nascimento'] ?? $defaults['nascimento'] ?? null);
+        if ($nascimento === '') {
+            $nascimento = self::DEFAULT_CLIENT_BIRTH_DATE;
+        }
+
+        $telefoneDigits = preg_replace('/\D+/', '', (string) ($input['telefone'] ?? $defaults['telefone'] ?? ''));
+        if (! $this->isValidBrazilCellPhone($telefoneDigits)) {
+            $telefoneDigits = $this->generateRandomPhoneNumber();
+        }
+
+        $clienteSexo = trim((string) ($input['cliente_sexo'] ?? $defaults['cliente_sexo'] ?? self::DEFAULT_CLIENT_SEX));
+        if ($clienteSexo === '') {
+            $clienteSexo = self::DEFAULT_CLIENT_SEX;
+        }
+
+        $email = $this->toNullableString($input['email'] ?? $defaults['email'] ?? null);
+        if ($email === null) {
+            $email = 'naotem@gmail.com';
+        }
+
+        $tipoConsulta = trim((string) ($input['tipoConsulta'] ?? $defaults['tipoConsulta'] ?? 'Individual'));
+        if ($tipoConsulta === '') {
+            $tipoConsulta = 'Individual';
+        }
+
+        $holdPending = $this->toBoolean($input['hold_pending'] ?? $defaults['hold_pending'] ?? null, false);
+
+        return [
+            'cliente_cpf' => mb_substr($cpf, 0, 20),
+            'cliente_sexo' => mb_substr($clienteSexo, 0, 20),
+            'nascimento' => $nascimento,
+            'cliente_nome' => mb_substr($nome, 0, 255),
+            'email' => mb_substr($email, 0, 255),
+            'telefone' => mb_substr($telefoneDigits, 0, 20),
+            'status' => $holdPending ? self::HOLD_CLIENT_STATUS : self::DEFAULT_CLIENT_STATUS,
+            'tipoConsulta' => mb_substr($tipoConsulta, 0, 255),
+            'id_user' => $idUser,
+            'id_equipe' => $idEquipe,
+            'id_roles' => $idRole,
+        ];
+    }
+
+    private function insertConsultaRows(array $payloads): array
+    {
+        if (empty($payloads)) {
+            return [];
+        }
+
+        $insertedIds = [];
+        $connection = DB::connection('sqlsrv_kinghost_vps');
+        $chunkSize = 150;
+
+        $connection->transaction(function () use ($connection, $payloads, $chunkSize, &$insertedIds): void {
+            foreach (array_chunk($payloads, $chunkSize) as $chunk) {
+                $valuesSql = [];
+                $bindings = [];
+
+                foreach ($chunk as $payload) {
+                    $valuesSql[] = '(?, ?, ?, ?, ?, ?, SYSDATETIME(), ?, NULL, NULL, NULL, ?, ?, ?, ?)';
+                    $bindings[] = $payload['cliente_cpf'];
+                    $bindings[] = $payload['cliente_sexo'];
+                    $bindings[] = $payload['nascimento'];
+                    $bindings[] = $payload['cliente_nome'];
+                    $bindings[] = $payload['email'];
+                    $bindings[] = $payload['telefone'];
+                    $bindings[] = $payload['status'];
+                    $bindings[] = $payload['tipoConsulta'];
+                    $bindings[] = $payload['id_user'];
+                    $bindings[] = $payload['id_equipe'];
+                    $bindings[] = $payload['id_roles'];
+                }
+
+                $sql = "
+                    INSERT INTO [consultas_v8].[dbo].[consulta_v8] (
+                        [cliente_cpf],
+                        [cliente_sexo],
+                        [nascimento],
+                        [cliente_nome],
+                        [email],
+                        [telefone],
+                        [created_at],
+                        [status],
+                        [status_consulta_v8],
+                        [valor_liberado],
+                        [descricao_v8],
+                        [tipoConsulta],
+                        [id_user],
+                        [id_equipe],
+                        [id_roles]
+                    )
+                    OUTPUT INSERTED.[id] AS [id]
+                    VALUES ".implode(",\n", $valuesSql).";
+                ";
+
+                $rows = $connection->select($sql, $bindings);
+                foreach ($rows as $row) {
+                    $insertedIds[] = (int) ($row->id ?? 0);
+                }
+            }
+        });
+
+        return $insertedIds;
+    }
+
+    private function isValidBrazilCellPhone(string $digits): bool
+    {
+        return strlen($digits) === 11
+            && substr($digits, 2, 1) === '9'
+            && $digits >= '11911111111'
+            && $digits <= '99999999999';
+    }
+
+    private function toBoolean($value, bool $default = false): bool
+    {
+        if ($value === null) {
+            return $default;
+        }
+
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        $parsed = filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        return $parsed ?? $default;
     }
 
     private function loadAccountsWithAvailableLimit(): array
@@ -512,14 +810,20 @@ class ConsultaV8Controller extends Controller
 
         foreach ($clients as $client) {
             $clientUserId = (int) ($client->id_user ?? 0);
+            $clientEquipeId = (int) ($client->id_equipe ?? 0);
 
-            $allowedIndexes = $this->getAllowedAccountIndexes($accounts, $clientUserId);
+            $allowedIndexes = $this->getAllowedAccountIndexes(
+                $accounts,
+                $clientUserId > 0 ? $clientUserId : null,
+                $clientEquipeId > 0 ? $clientEquipeId : null
+            );
             if (empty($allowedIndexes)) {
                 continue;
             }
 
-            if (!isset($userPointers[$clientUserId])) {
-                $userPointers[$clientUserId] = 0;
+            $pointerKey = $clientUserId.'|'.$clientEquipeId;
+            if (!isset($userPointers[$pointerKey])) {
+                $userPointers[$pointerKey] = 0;
             }
 
             $totalAllowed = count($allowedIndexes);
@@ -527,9 +831,9 @@ class ConsultaV8Controller extends Controller
             $selectedIndex = null;
 
             while ($tries < $totalAllowed) {
-                $candidatePosition = $userPointers[$clientUserId] % $totalAllowed;
+                $candidatePosition = $userPointers[$pointerKey] % $totalAllowed;
                 $accountIndex = $allowedIndexes[$candidatePosition];
-                $userPointers[$clientUserId] = ($userPointers[$clientUserId] + 1) % $totalAllowed;
+                $userPointers[$pointerKey] = ($userPointers[$pointerKey] + 1) % $totalAllowed;
                 $tries++;
 
                 if ($accounts[$accountIndex]['remaining'] <= 0) {
@@ -1065,15 +1369,15 @@ class ConsultaV8Controller extends Controller
         return (int) $value;
     }
 
-    private function filterAccountsForUser(array $accounts, ?int $userId): array
+    private function filterAccountsForUser(array $accounts, ?int $userId, ?int $equipeId = null): array
     {
-        if ($userId === null || $userId === 1) {
+        if ($userId === 1) {
             return $accounts;
         }
 
         $filtered = [];
         foreach ($accounts as $account) {
-            if ($this->isAccountAllowedForUser($account['id'], $userId)) {
+            if ($this->isAccountAllowedForUser($account['id'], $userId, $equipeId)) {
                 $filtered[] = $account;
             }
         }
@@ -1081,11 +1385,11 @@ class ConsultaV8Controller extends Controller
         return $filtered;
     }
 
-    private function getAllowedAccountIndexes(array $accounts, ?int $userId): array
+    private function getAllowedAccountIndexes(array $accounts, ?int $userId, ?int $equipeId = null): array
     {
         $indexes = [];
         foreach ($accounts as $index => $account) {
-            if ($this->isAccountAllowedForUser($account['id'], $userId)) {
+            if ($this->isAccountAllowedForUser($account['id'], $userId, $equipeId)) {
                 $indexes[] = $index;
             }
         }
@@ -1093,7 +1397,7 @@ class ConsultaV8Controller extends Controller
         return $indexes;
     }
 
-    private function isAccountAllowedForUser(int $accountId, ?int $userId): bool
+    private function isAccountAllowedForUser(int $accountId, ?int $userId, ?int $equipeId = null): bool
     {
         if ($userId === 1) {
             return true;
@@ -1107,6 +1411,13 @@ class ConsultaV8Controller extends Controller
 
         if (isset($special[$userId])) {
             return in_array($accountId, $special[$userId], true);
+        }
+
+        $specialEquipes = [1, 2, 3, 1011, 1012, 1013, 1045, 1046, 2045];
+        $allowedByEquipe = [14, 15, 17, 18, 19, 20, 21, 22];
+
+        if ($equipeId !== null && in_array($equipeId, $specialEquipes, true)) {
+            return in_array($accountId, $allowedByEquipe, true);
         }
 
         return !in_array($accountId, [12, 13, 16], true);
