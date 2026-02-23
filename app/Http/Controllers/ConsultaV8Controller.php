@@ -157,6 +157,7 @@ class ConsultaV8Controller extends Controller
             'id_role' => ['required', 'integer'],
             'cliente_sexo' => ['nullable', 'string', 'max:20'],
             'email' => ['nullable', 'string', 'max:255'],
+            'tipoConsulta' => ['nullable', 'string', 'max:255'],
         ]);
 
         $cpf = preg_replace('/\D+/', '', (string) $validated['cliente_cpf']);
@@ -194,6 +195,11 @@ class ConsultaV8Controller extends Controller
             $email = 'naotem@gmail.com';
         }
 
+        $tipoConsulta = trim((string) ($validated['tipoConsulta'] ?? 'Individual'));
+        if ($tipoConsulta === '') {
+            $tipoConsulta = 'Individual';
+        }
+
         $payload = [
             'cliente_cpf' => $cpf,
             'cliente_sexo' => $clienteSexo,
@@ -202,6 +208,7 @@ class ConsultaV8Controller extends Controller
             'email' => $email,
             'telefone' => $telefoneDigits,
             'status' => self::DEFAULT_CLIENT_STATUS,
+            'tipoConsulta' => mb_substr($tipoConsulta, 0, 255),
             'id_user' => (int) $validated['id_user'],
             'id_equipe' => (int) $validated['id_equipe'],
             'id_roles' => (int) $validated['id_role'],
@@ -220,12 +227,13 @@ class ConsultaV8Controller extends Controller
                 [status_consulta_v8],
                 [valor_liberado],
                 [descricao_v8],
+                [tipoConsulta],
                 [id_user],
                 [id_equipe],
                 [id_roles]
             )
             OUTPUT INSERTED.[id] AS [id]
-            VALUES (?, ?, ?, ?, ?, ?, SYSDATETIME(), ?, NULL, NULL, NULL, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, SYSDATETIME(), ?, NULL, NULL, NULL, ?, ?, ?, ?);
         ", [
             $payload['cliente_cpf'],
             $payload['cliente_sexo'],
@@ -234,6 +242,7 @@ class ConsultaV8Controller extends Controller
             $payload['email'],
             $payload['telefone'],
             $payload['status'],
+            $payload['tipoConsulta'],
             $payload['id_user'],
             $payload['id_equipe'],
             $payload['id_roles'],
@@ -247,6 +256,7 @@ class ConsultaV8Controller extends Controller
                 'cliente_cpf' => $payload['cliente_cpf'],
                 'cliente_nome' => $payload['cliente_nome'],
                 'status' => $payload['status'],
+                'tipoConsulta' => $payload['tipoConsulta'],
                 'created_at' => now()->toIso8601String(),
             ],
         ], 201);
@@ -255,6 +265,8 @@ class ConsultaV8Controller extends Controller
 
     public function listLimites(Request $request): JsonResponse
     {
+        $userId = $this->toNullableInt($request->query('id_user'));
+
         $rows = DB::connection('sqlsrv_kinghost_vps')->select("
             SELECT TOP (1000)
                 [id],
@@ -269,16 +281,60 @@ class ConsultaV8Controller extends Controller
             ORDER BY [id] DESC
         ");
 
+        $rows = array_map(static fn($row) => (array) $row, $rows);
+
+        $filtered = $this->filterAccountsForUser($rows, $userId);
+
         return response()->json([
             'ok' => true,
-            'total' => count($rows),
-            'data' => $rows,
+            'total' => count($filtered),
+            'data' => array_values($filtered),
         ]);
     }
 
     public function listConsultas(Request $request): JsonResponse
     {
-        $rows = DB::connection('sqlsrv_kinghost_vps')->select("
+        $userId = $this->toNullableInt($request->query('id_user'));
+        $cpf = preg_replace('/\D+/', '', (string) $request->query('cpf', ''));
+        $nome = $this->normalizeClientName((string) $request->query('nome', ''));
+
+        $hasTokenUsadoColumn = false;
+        try {
+            $columnCheck = DB::connection('sqlsrv_kinghost_vps')->selectOne("
+                SELECT CASE
+                    WHEN COL_LENGTH('consultas_v8.dbo.consulta_v8', 'token_usado') IS NULL THEN 0
+                    ELSE 1
+                END AS [has_token_usado]
+            ");
+            $hasTokenUsadoColumn = (int) ($columnCheck->has_token_usado ?? 0) === 1;
+        } catch (\Throwable $e) {
+            $hasTokenUsadoColumn = false;
+        }
+
+        $where = [];
+        $bindings = [];
+
+        if ($userId !== null && $userId !== 1) {
+            $where[] = "[id_user] = ?";
+            $bindings[] = $userId;
+        }
+
+        if ($cpf !== '') {
+            $where[] = "REPLACE(REPLACE(REPLACE(COALESCE([cliente_cpf], ''), '.', ''), '-', ''), ' ', '') = ?";
+            $bindings[] = $cpf;
+        }
+
+        if ($nome !== '') {
+            $where[] = "UPPER(LTRIM(RTRIM(COALESCE([cliente_nome], '')))) = ?";
+            $bindings[] = $nome;
+        }
+
+        $whereSql = empty($where) ? '' : 'WHERE '.implode(' AND ', $where);
+        $tokenUsadoSelect = $hasTokenUsadoColumn
+            ? '[token_usado]'
+            : 'CAST(NULL AS NVARCHAR(255)) AS [token_usado]';
+
+        $sql = sprintf("
             SELECT TOP (1000)
                 [id],
                 [cliente_cpf],
@@ -292,12 +348,17 @@ class ConsultaV8Controller extends Controller
                 [status_consulta_v8],
                 [valor_liberado],
                 [descricao_v8],
+                [tipoConsulta],
+                %s,
                 [id_user],
                 [id_equipe],
                 [id_roles]
             FROM [consultas_v8].[dbo].[consulta_v8]
+            %s
             ORDER BY [id] DESC
-        ");
+        ", $tokenUsadoSelect, $whereSql);
+
+        $rows = DB::connection('sqlsrv_kinghost_vps')->select($sql, $bindings);
 
         return response()->json([
             'ok' => true,
@@ -386,6 +447,7 @@ class ConsultaV8Controller extends Controller
                 [descricao_v8],
                 [valor_liberado],
                 [created_at],
+                [tipoConsulta],
                 [id_user],
                 [id_equipe],
                 [id_roles]
@@ -406,23 +468,45 @@ class ConsultaV8Controller extends Controller
             return $distribution;
         }
 
-        $cursor = 0;
-        $totalAccounts = count($accounts);
+        $userPointers = [];
 
         foreach ($clients as $client) {
-            $tries = 0;
-            while ($tries < $totalAccounts && $accounts[$cursor]['remaining'] <= 0) {
-                $cursor = ($cursor + 1) % $totalAccounts;
-                $tries++;
+            $clientUserId = (int) ($client->id_user ?? 0);
+
+            $allowedIndexes = $this->getAllowedAccountIndexes($accounts, $clientUserId);
+            if (empty($allowedIndexes)) {
+                continue;
             }
 
-            if ($tries >= $totalAccounts && $accounts[$cursor]['remaining'] <= 0) {
+            if (!isset($userPointers[$clientUserId])) {
+                $userPointers[$clientUserId] = 0;
+            }
+
+            $totalAllowed = count($allowedIndexes);
+            $tries = 0;
+            $selectedIndex = null;
+
+            while ($tries < $totalAllowed) {
+                $candidatePosition = $userPointers[$clientUserId] % $totalAllowed;
+                $accountIndex = $allowedIndexes[$candidatePosition];
+                $userPointers[$clientUserId] = ($userPointers[$clientUserId] + 1) % $totalAllowed;
+                $tries++;
+
+                if ($accounts[$accountIndex]['remaining'] <= 0) {
+                    continue;
+                }
+
+                $selectedIndex = $accountIndex;
                 break;
             }
 
-            $distribution[$accounts[$cursor]['id']][] = $client;
-            $accounts[$cursor]['remaining']--;
-            $cursor = ($cursor + 1) % $totalAccounts;
+            if ($selectedIndex === null) {
+                continue;
+            }
+
+            $accountId = $accounts[$selectedIndex]['id'];
+            $distribution[$accountId][] = $client;
+            $accounts[$selectedIndex]['remaining']--;
         }
 
         return $distribution;
@@ -557,20 +641,20 @@ class ConsultaV8Controller extends Controller
                 }
             }
 
-            if (! $allRetryable || $attempt === self::FINAL_GET_MAX_ATTEMPTS) {
-                break;
-            }
-
-            sleep($retrySleepSeconds);
+        if (! $allRetryable || $attempt === self::FINAL_GET_MAX_ATTEMPTS) {
+            break;
         }
+
+        sleep($retrySleepSeconds);
+    }
 
         $duplicatesCreated = 0;
 
         $first = true;
         foreach ($entries as $entry) {
-            $isRetryable = $this->isRetryableV8Status($entry['status']);
-            $payload = [
-                'status_consulta_v8' => $entry['status'],
+        $isRetryable = $this->isRetryableV8Status($entry['status']);
+        $payload = [
+            'status_consulta_v8' => $entry['status'],
                 'descricao_v8' => $entry['description'],
                 'valor_liberado' => $entry['available_margin'],
                 'status' => $isRetryable ? 'Pendente' : 'Consultado',
@@ -582,8 +666,7 @@ class ConsultaV8Controller extends Controller
                 continue;
             }
 
-            $newId = $this->duplicateClientRow((int) $client->id);
-            $this->mergeClientRow($newId, $payload);
+            $this->mergeClientRow((int) $client->id, $payload);
             $duplicatesCreated++;
         }
 
@@ -678,6 +761,7 @@ class ConsultaV8Controller extends Controller
         return null;
     }
 
+
     private function mergeClientRow(int $id, array $payload): void
     {
         DB::connection('sqlsrv_kinghost_vps')->statement("
@@ -722,6 +806,7 @@ class ConsultaV8Controller extends Controller
                 [descricao_v8],
                 [valor_liberado],
                 [created_at],
+                [tipoConsulta],
                 [id_user],
                 [id_equipe],
                 [id_roles]
@@ -739,6 +824,7 @@ class ConsultaV8Controller extends Controller
                 [descricao_v8],
                 [valor_liberado],
                 SYSDATETIME(),
+                [tipoConsulta],
                 [id_user],
                 [id_equipe],
                 [id_roles]
@@ -926,5 +1012,63 @@ class ConsultaV8Controller extends Controller
         $trimmed = trim((string) $value);
 
         return $trimmed === '' ? null : $trimmed;
+    }
+
+    private function toNullableInt($value): ?int
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (!is_numeric($value)) {
+            return null;
+        }
+        return (int) $value;
+    }
+
+    private function filterAccountsForUser(array $accounts, ?int $userId): array
+    {
+        if ($userId === null || $userId === 1) {
+            return $accounts;
+        }
+
+        $filtered = [];
+        foreach ($accounts as $account) {
+            if ($this->isAccountAllowedForUser($account['id'], $userId)) {
+                $filtered[] = $account;
+            }
+        }
+
+        return $filtered;
+    }
+
+    private function getAllowedAccountIndexes(array $accounts, ?int $userId): array
+    {
+        $indexes = [];
+        foreach ($accounts as $index => $account) {
+            if ($this->isAccountAllowedForUser($account['id'], $userId)) {
+                $indexes[] = $index;
+            }
+        }
+
+        return $indexes;
+    }
+
+    private function isAccountAllowedForUser(int $accountId, ?int $userId): bool
+    {
+        if ($userId === 1) {
+            return true;
+        }
+
+        $special = [
+            4354 => [13],
+            3347 => [16],
+            3349 => [12],
+        ];
+
+        if (isset($special[$userId])) {
+            return in_array($accountId, $special[$userId], true);
+        }
+
+        return !in_array($accountId, [12, 13, 16], true);
     }
 }
