@@ -242,6 +242,36 @@ class ConsultaV8Controller extends Controller
         ], 201);
     }
 
+    public function storeIndividual(Request $request): JsonResponse
+    {
+        try {
+            $payload = $this->buildStorePayloadFromInput($request->all());
+        } catch (\InvalidArgumentException $e) {
+            return response()->json([
+                'ok' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+
+        $insertedIds = $this->insertConsultaRows([$payload]);
+        $insertedId = (int) ($insertedIds[0] ?? 0);
+        $holdPending = $payload['status'] === self::HOLD_CLIENT_STATUS;
+
+        return response()->json([
+            'ok' => true,
+            'message' => 'Cliente enfileirado para consulta V8.',
+            'data' => [
+                'id' => $insertedId,
+                'cliente_cpf' => $payload['cliente_cpf'],
+                'cliente_nome' => $payload['cliente_nome'],
+                'status' => $payload['status'],
+                'tipoConsulta' => $payload['tipoConsulta'],
+                'hold_pending' => $holdPending,
+                'created_at' => now()->toIso8601String(),
+            ],
+        ], 201);
+    }
+
     public function releasePendingByScope(Request $request): JsonResponse
     {
         $validated = $request->validate([

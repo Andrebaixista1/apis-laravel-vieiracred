@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\ConsultaV8Controller;
+use App\Http\Controllers\ConsulaPresencaController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
@@ -12,7 +13,7 @@ use Illuminate\Support\Facades\Route;
 |
 | Here is where you can register API routes for your application. These
 | routes are loaded by the RouteServiceProvider within a group which
-| is assigned the "api" middleware group. Enjoy building your API!
+| is assigned the api middleware group. Enjoy building your API!
 |
 */
 
@@ -56,6 +57,9 @@ Route::get('/db-health', function () {
 });
 
 Route::get('/consulta-v8/run', [ConsultaV8Controller::class, 'run']);
+Route::get('/consulta-presenca/run', [ConsulaPresencaController::class, 'run']);
 
 Route::post('/consulta-v8', [ConsultaV8Controller::class, 'store']);
+Route::post('/consulta-v8/individual', [ConsultaV8Controller::class, 'storeIndividual']);
+Route::post('/consulta-v8/liberar-pendentes', [ConsultaV8Controller::class, 'releasePendingByScope']);
 Route::delete('/consulta-v8/consultas', [ConsultaV8Controller::class, 'deleteConsultasByLote']);
