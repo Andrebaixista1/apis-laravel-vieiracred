@@ -367,6 +367,46 @@ class ConsultaV8Controller extends Controller
         ]);
     }
 
+    public function deleteConsultasByLote(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'id_user' => ['required', 'integer'],
+            'id_equipe' => ['required', 'integer'],
+            'tipoConsulta' => ['required', 'string', 'max:255'],
+        ]);
+
+        $idUser = (int) $validated['id_user'];
+        $idEquipe = (int) $validated['id_equipe'];
+        $tipoConsulta = trim((string) $validated['tipoConsulta']);
+
+        if ($tipoConsulta === '') {
+            return response()->json([
+                'ok' => false,
+                'message' => 'tipoConsulta invalido.',
+            ], 422);
+        }
+
+        $deleted = DB::connection('sqlsrv_kinghost_vps')->delete("
+            DELETE FROM [consultas_v8].[dbo].[consulta_v8]
+            WHERE [id_user] = ?
+              AND [id_equipe] = ?
+              AND [tipoConsulta] = ?
+        ", [$idUser, $idEquipe, $tipoConsulta]);
+
+        return response()->json([
+            'ok' => true,
+            'message' => $deleted > 0
+                ? 'Lote removido com sucesso.'
+                : 'Nenhum registro encontrado para os filtros informados.',
+            'deleted_count' => (int) $deleted,
+            'filters' => [
+                'id_user' => $idUser,
+                'id_equipe' => $idEquipe,
+                'tipoConsulta' => $tipoConsulta,
+            ],
+        ]);
+    }
+
     private function loadAccountsWithAvailableLimit(): array
     {
         $rows = DB::connection('sqlsrv_kinghost_vps')->select("
