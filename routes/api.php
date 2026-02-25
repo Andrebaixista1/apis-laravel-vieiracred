@@ -1,7 +1,7 @@
 <?php
 
 use App\Http\Controllers\ConsultaV8Controller;
-use App\Http\Controllers\ConsulaPresencaController;
+use App\Http\Controllers\ConsultaPresencaController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
@@ -57,7 +57,9 @@ Route::get('/db-health', function () {
 });
 
 Route::get('/consulta-v8/run', [ConsultaV8Controller::class, 'run']);
-Route::get('/consulta-presenca/run', [ConsulaPresencaController::class, 'run']);
+Route::get('/consulta-presenca/run', [ConsultaPresencaController::class, 'run']);
+Route::delete('/consulta-presenca/consultas', [ConsultaPresencaController::class, 'deleteConsultasByLote']);
+Route::post('/consulta-presenca/consultas', [ConsultaPresencaController::class, 'deleteConsultasByLote']);
 
 Route::post('/consulta-v8', [ConsultaV8Controller::class, 'store']);
 Route::post('/consulta-v8/individual', [ConsultaV8Controller::class, 'storeIndividual']);
