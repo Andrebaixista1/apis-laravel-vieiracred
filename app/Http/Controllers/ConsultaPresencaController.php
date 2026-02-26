@@ -150,6 +150,7 @@ class ConsultaPresencaController extends Controller
                     } catch (\Throwable $e) {
                         $summary['erros']++;
                         $loginSummariesById[$accountId]['erros']++;
+                        $this->incrementConsultedCounter($accountId);
                         $this->markPendingAsError($pendingId, $e->getMessage());
                     } finally {
                         $this->sleepSeconds(self::QUEUE_DELAY_SECONDS);
@@ -275,20 +276,18 @@ SQL;
             $total = max(0, (int) ($row->total ?? 0));
             $consultados = max(0, (int) ($row->consultados ?? 0));
 
-            if ($total > 0 && $consultados >= $total) {
-                $updatedAt = $this->parseNullableCarbon($row->updated_at ?? null);
-                $canReset = $updatedAt === null || $updatedAt->lte($now->copy()->subHours(24));
+            $updatedAt = $this->parseNullableCarbon($row->updated_at ?? null);
+            $canResetDailyCounter = $consultados > 0 && $updatedAt !== null && $updatedAt->lte($now->copy()->subHours(24));
 
-                if ($canReset) {
-                    $resetSql = <<<'SQL'
+            if ($canResetDailyCounter) {
+                $resetSql = <<<'SQL'
 UPDATE [consultas_presenca].[dbo].[limites_presenca]
 SET [consultados] = 0,
     [updated_at] = SYSDATETIME()
 WHERE [id] = ?
 SQL;
-                    DB::connection(self::DB_CONNECTION)->update($resetSql, [$id]);
-                    $consultados = 0;
-                }
+                DB::connection(self::DB_CONNECTION)->update($resetSql, [$id]);
+                $consultados = 0;
             }
 
             $remaining = max(0, $total - $consultados);
