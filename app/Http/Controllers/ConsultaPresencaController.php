@@ -225,13 +225,18 @@ class ConsultaPresencaController extends Controller
             ], 422);
         }
 
-        $deleted = DB::connection(self::DB_CONNECTION)->delete("
-            DELETE FROM [consultas_presenca].[dbo].[consulta_presenca]
-            WHERE [id_user] = ?
-              AND [equipe_id] = ?
-              AND [id_consulta_presenca] = ?
-              AND [tipoConsulta] = ?
-        ", [$idUser, $idEquipe, $idConsultaPresenca, $tipoConsulta]);
+        $deleted = 0;
+        do {
+            $deletedBatch = (int) DB::connection(self::DB_CONNECTION)->delete("
+                DELETE TOP (1000) FROM [consultas_presenca].[dbo].[consulta_presenca]
+                WHERE [id_user] = ?
+                  AND [equipe_id] = ?
+                  AND [id_consulta_presenca] = ?
+                  AND [tipoConsulta] = ?
+            ", [$idUser, $idEquipe, $idConsultaPresenca, $tipoConsulta]);
+
+            $deleted += $deletedBatch;
+        } while ($deletedBatch > 0);
 
         return response()->json([
             'ok' => true,
