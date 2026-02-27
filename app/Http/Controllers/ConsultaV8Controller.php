@@ -20,6 +20,8 @@ class ConsultaV8Controller extends Controller
     private const PROVIDER_DEFAULT = 'QI';
     private const HTTP_TIMEOUT_SECONDS = 30;
     private const FINAL_GET_MAX_ATTEMPTS = 5;
+    private const RUN_ACCOUNT_INTERVAL_SECONDS = 5;
+    private const RUN_IDLE_SLEEP_MICROSECONDS = 200000;
     private const DEFAULT_CLIENT_BIRTH_DATE = '1996-05-15';
     private const DEFAULT_CLIENT_SEX = 'male';
     private const DEFAULT_CLIENT_STATUS = 'pendente';
@@ -33,12 +35,45 @@ class ConsultaV8Controller extends Controller
 
     public function run(Request $request): JsonResponse
     {
-        $lock = cache()->lock('consulta-v8-manual-run', 3600);
+        $idUserScope = $this->toNullableInt($request->query('id_user', $request->input('id_user')));
+        $idEquipeScope = $this->toNullableInt($request->query('id_equipe', $request->input('id_equipe')));
+
+        if ($idUserScope !== null && $idUserScope <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_user invalido.',
+            ], 422);
+        }
+
+        if ($idEquipeScope !== null && $idEquipeScope <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_equipe invalido.',
+            ], 422);
+        }
+
+        $scopeKey = 'all';
+        if ($idUserScope !== null) {
+            $scopeKey = 'user_'.$idUserScope;
+            if ($idEquipeScope !== null) {
+                $scopeKey .= '_eq_'.$idEquipeScope;
+            }
+        } elseif ($idEquipeScope !== null) {
+            $scopeKey = 'eq_'.$idEquipeScope;
+        }
+
+        $lockKey = 'consulta-v8-manual-run:'.$scopeKey;
+        $lock = cache()->lock($lockKey, 3600);
 
         if (! $lock->get()) {
             return response()->json([
                 'ok' => false,
-                'message' => 'Ja existe uma execucao em andamento.',
+                'message' => 'Ja existe uma execucao em andamento para este escopo.',
+                'scope' => [
+                    'id_user' => $idUserScope,
+                    'id_equipe' => $idEquipeScope,
+                    'scope_key' => $scopeKey,
+                ],
             ], 409);
         }
 
@@ -48,6 +83,12 @@ class ConsultaV8Controller extends Controller
             'started_at' => now()->toIso8601String(),
             'finished_at' => null,
             'duration_ms' => 0,
+            'scope' => [
+                'id_user' => $idUserScope,
+                'id_equipe' => $idEquipeScope,
+                'scope_key' => $scopeKey,
+            ],
+            'lock_key' => $lockKey,
             'total_logins' => 0,
             'logins_com_limite' => 0,
             'pendentes_encontrados' => 0,
@@ -73,16 +114,23 @@ class ConsultaV8Controller extends Controller
             $summary['logins_com_limite'] = count($accounts);
             $totalCapacity = array_sum(array_column($accounts, 'remaining'));
 
-            $pendingClients = $this->loadPendingClients($totalCapacity);
+            $pendingClients = $this->loadPendingClients($totalCapacity, $idUserScope, $idEquipeScope);
             $summary['pendentes_encontrados'] = count($pendingClients);
 
             $distribution = $this->distributeClientsAcrossAccounts($pendingClients, $accounts);
             $summary['clientes_distribuidos'] = array_sum(array_map('count', $distribution));
 
+            $loginsById = [];
+            $tokensByAccount = [];
+            $queueByAccount = [];
+            $nextAvailableAtByAccount = [];
+            $activeAccountIds = [];
+
             foreach ($accounts as $account) {
-                $accountClients = $distribution[$account['id']] ?? [];
-                $loginSummary = [
-                    'id' => $account['id'],
+                $accountId = (int) $account['id'];
+                $accountClients = array_values($distribution[$accountId] ?? []);
+                $loginsById[$accountId] = [
+                    'id' => $accountId,
                     'email' => $account['email'],
                     'limite_restante_inicio' => $account['remaining'],
                     'clientes_alocados' => count($accountClients),
@@ -91,42 +139,94 @@ class ConsultaV8Controller extends Controller
                 ];
 
                 if (empty($accountClients)) {
-                    $summary['logins'][] = $loginSummary;
                     continue;
                 }
 
                 try {
-                    $accessToken = $this->requestV8AccessToken($account['email'], $account['senha']);
+                    $tokensByAccount[$accountId] = $this->requestV8AccessToken($account['email'], $account['senha']);
                 } catch (\Throwable $e) {
-                    $loginSummary['clientes_erro'] = count($accountClients);
+                    $loginsById[$accountId]['clientes_erro'] = count($accountClients);
                     $summary['clientes_erro'] += count($accountClients);
-                    $loginSummary['erro_token'] = mb_substr($e->getMessage(), 0, 300);
-                    $summary['logins'][] = $loginSummary;
+                    $loginsById[$accountId]['erro_token'] = mb_substr($e->getMessage(), 0, 300);
                     continue;
                 }
 
-                foreach ($accountClients as $index => $client) {
+                $queueByAccount[$accountId] = $accountClients;
+                $nextAvailableAtByAccount[$accountId] = 0.0;
+                $activeAccountIds[] = $accountId;
+            }
+
+            while (!empty($activeAccountIds)) {
+                $now = microtime(true);
+                $processedInThisCycle = false;
+
+                foreach ($activeAccountIds as $key => $accountId) {
+                    $accountQueue = $queueByAccount[$accountId] ?? [];
+                    if (empty($accountQueue)) {
+                        unset($activeAccountIds[$key]);
+                        continue;
+                    }
+
+                    $nextAvailableAt = (float) ($nextAvailableAtByAccount[$accountId] ?? 0.0);
+                    if ($now < $nextAvailableAt) {
+                        continue;
+                    }
+
+                    $client = array_shift($accountQueue);
+                    $queueByAccount[$accountId] = $accountQueue;
+
                     try {
-                        $result = $this->processClient($accessToken, $client, $account['id']);
+                        $result = $this->processClient($tokensByAccount[$accountId], $client, $accountId);
                         $summary['clientes_processados']++;
                         $summary['duplicados_criados'] += $result['duplicates_created'];
-                        $loginSummary['clientes_processados']++;
+                        $loginsById[$accountId]['clientes_processados']++;
                         if (!empty($result['should_increment_limit'])) {
-                            $this->incrementConsultedCounter($account['id']);
+                            $this->incrementConsultedCounter($accountId);
                         }
                     } catch (\Throwable $e) {
                         $summary['clientes_erro']++;
-                        $loginSummary['clientes_erro']++;
+                        $loginsById[$accountId]['clientes_erro']++;
                         $this->markClientAsError((int) $client->id, $e->getMessage());
-                    } finally {
-                        $hasNextClient = $index < (count($accountClients) - 1);
-                        if ($hasNextClient) {
-                            sleep(5);
-                        }
+                    }
+
+                    if (!empty($accountQueue)) {
+                        $nextAvailableAtByAccount[$accountId] = microtime(true) + self::RUN_ACCOUNT_INTERVAL_SECONDS;
+                    } else {
+                        unset($activeAccountIds[$key]);
+                    }
+
+                    $processedInThisCycle = true;
+                }
+
+                if ($processedInThisCycle) {
+                    $activeAccountIds = array_values($activeAccountIds);
+                    continue;
+                }
+
+                $soonest = null;
+                foreach ($activeAccountIds as $accountId) {
+                    $candidate = (float) ($nextAvailableAtByAccount[$accountId] ?? 0.0);
+                    if ($soonest === null || $candidate < $soonest) {
+                        $soonest = $candidate;
                     }
                 }
 
-                $summary['logins'][] = $loginSummary;
+                $sleepUs = self::RUN_IDLE_SLEEP_MICROSECONDS;
+                if ($soonest !== null) {
+                    $waitSeconds = max(0.0, $soonest - microtime(true));
+                    if ($waitSeconds > 0) {
+                        $sleepUs = max(20000, min(self::RUN_IDLE_SLEEP_MICROSECONDS, (int) round($waitSeconds * 1000000)));
+                    }
+                }
+                usleep($sleepUs);
+            }
+
+            $summary['logins'] = [];
+            foreach ($accounts as $account) {
+                $accountId = (int) $account['id'];
+                if (isset($loginsById[$accountId])) {
+                    $summary['logins'][] = $loginsById[$accountId];
+                }
             }
 
             $summary['finished_at'] = now()->toIso8601String();
@@ -748,7 +848,7 @@ class ConsultaV8Controller extends Controller
                 [created_at],
                 [updated_at]
             FROM [consultas_v8].[dbo].[limites_v8]
-            ORDER BY [id] ASC
+            ORDER BY [id] DESC
         ");
 
         $accounts = [];
@@ -793,13 +893,30 @@ class ConsultaV8Controller extends Controller
         return $accounts;
     }
 
-    private function loadPendingClients(int $limit): array
+    private function loadPendingClients(int $limit, ?int $idUser = null, ?int $idEquipe = null): array
     {
         $safeLimit = max(0, $limit);
 
         if ($safeLimit === 0) {
             return [];
         }
+
+        $where = [
+            "UPPER(LTRIM(RTRIM(COALESCE([status], '')))) = 'PENDENTE'",
+        ];
+        $bindings = [];
+
+        if ($idUser !== null) {
+            $where[] = '[id_user] = ?';
+            $bindings[] = $idUser;
+        }
+
+        if ($idEquipe !== null) {
+            $where[] = '[id_equipe] = ?';
+            $bindings[] = $idEquipe;
+        }
+
+        $whereSql = implode(' AND ', $where);
 
         return DB::connection('sqlsrv_kinghost_vps')->select("
             SELECT TOP ($safeLimit)
@@ -820,9 +937,9 @@ class ConsultaV8Controller extends Controller
                 [id_equipe],
                 [id_roles]
             FROM [consultas_v8].[dbo].[consulta_v8]
-            WHERE UPPER(LTRIM(RTRIM(COALESCE([status], '')))) = 'PENDENTE'
-            ORDER BY [id] ASC
-        ");
+            WHERE $whereSql
+            ORDER BY [id] DESC
+        ", $bindings);
     }
 
     private function distributeClientsAcrossAccounts(array $clients, array &$accounts): array
@@ -1443,8 +1560,8 @@ class ConsultaV8Controller extends Controller
             return in_array($accountId, $special[$userId], true);
         }
 
-        $specialEquipes = [1, 2, 3, 1011, 1012, 1013, 1045, 1046, 2045];
-        $allowedByEquipe = [14, 15, 17, 18, 19, 20, 21, 22];
+        $specialEquipes = [1, 2, 3, 4, 1010, 1011, 1012, 1013, 1045, 1046, 2045];
+        $allowedByEquipe = [15, 17, 18, 19, 20, 21, 22];
 
         if ($equipeId !== null && in_array($equipeId, $specialEquipes, true)) {
             return in_array($accountId, $allowedByEquipe, true);
