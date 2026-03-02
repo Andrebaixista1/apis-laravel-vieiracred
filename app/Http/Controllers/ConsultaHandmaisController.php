@@ -125,6 +125,7 @@ class ConsultaHandmaisController extends Controller
                         $summary['erros']++;
                         $loginSummary['erros']++;
                         $this->markPendingAsError($pendingId, $e->getMessage());
+                        $this->removeFinalizedCpfDuplicates($this->normalizeCpf($pendingRow->cpf ?? ''), [$pendingId]);
                     } finally {
                         $this->sleepSeconds(self::RUN_DELAY_SECONDS);
                     }
@@ -703,6 +704,7 @@ class ConsultaHandmaisController extends Controller
                     (string) ($marginConflict['descricao'] ?? 'Conflito na simulacao HandMais.'),
                     (string) ($marginConflict['valor_margem'] ?? '0.00')
                 );
+                $this->removeFinalizedCpfDuplicates($cpf, [$pendingId]);
 
                 return [
                     'entries_count' => 0,
@@ -736,8 +738,9 @@ class ConsultaHandmaisController extends Controller
         ]);
 
         $duplicatesCreated = 0;
+        $keepIds = [$pendingId];
         for ($i = 1; $i < count($entries); $i++) {
-            $this->insertConsultaResultDuplicate([
+            $newId = $this->insertConsultaResultDuplicate([
                 'nome' => $nome,
                 'cpf' => $cpf,
                 'telefone' => $telefone,
@@ -752,8 +755,12 @@ class ConsultaHandmaisController extends Controller
                 'equipe_id' => $equipeId,
                 'id_consulta_hand' => $idConsultaHand,
             ]);
+            if ($newId > 0) {
+                $keepIds[] = $newId;
+            }
             $duplicatesCreated++;
         }
+        $this->removeFinalizedCpfDuplicates($cpf, $keepIds);
 
         return [
             'entries_count' => count($entries),
@@ -1772,6 +1779,53 @@ class ConsultaHandmaisController extends Controller
             $safeMargin,
             $id,
         ]);
+    }
+
+    private function removeFinalizedCpfDuplicates(string $cpf, array $keepIds = []): void
+    {
+        $cleanCpf = $this->normalizeCpf($cpf);
+        if ($cleanCpf === '') {
+            return;
+        }
+
+        $keepIds = array_values(array_unique(array_filter(array_map('intval', $keepIds), static fn (int $id): bool => $id > 0)));
+
+        $bindings = [$cleanCpf];
+        $keepFilter = '';
+        if (! empty($keepIds)) {
+            $placeholders = implode(', ', array_fill(0, count($keepIds), '?'));
+            $keepFilter = " AND [id] NOT IN ($placeholders)";
+            foreach ($keepIds as $id) {
+                $bindings[] = $id;
+            }
+        }
+
+        DB::connection(self::DB_CONNECTION)->statement("
+            WITH ranked AS (
+                SELECT
+                    [id],
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            LTRIM(RTRIM(COALESCE([cpf], ''))),
+                            UPPER(LTRIM(RTRIM(COALESCE([status], '')))),
+                            LTRIM(RTRIM(COALESCE([nome_tabela], ''))),
+                            LTRIM(RTRIM(COALESCE([id_tabela], ''))),
+                            LTRIM(RTRIM(COALESCE([token_tabela], '')))
+                        ORDER BY
+                            COALESCE([updated_at], [created_at], SYSDATETIME()) DESC,
+                            [id] DESC
+                    ) AS [rn]
+                FROM [consultas_handmais].[dbo].[consulta_handmais]
+                WHERE LTRIM(RTRIM(COALESCE([cpf], ''))) = ?
+                  AND UPPER(LTRIM(RTRIM(COALESCE([status], '')))) IN ('CONSULTADO', 'ERRO')
+            )
+            DELETE FROM [consultas_handmais].[dbo].[consulta_handmais]
+            WHERE [id] IN (
+                SELECT [id]
+                FROM ranked
+                WHERE [rn] > 1{$keepFilter}
+            )
+        ", $bindings);
     }
 
     private function incrementConsultedCounter(int $accountId): void
