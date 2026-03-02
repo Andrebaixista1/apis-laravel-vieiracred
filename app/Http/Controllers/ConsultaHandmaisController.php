@@ -1073,6 +1073,11 @@ class ConsultaHandmaisController extends Controller
             return $preferred;
         }
 
+        $companyRequirement = $this->extractCompanyRequirementMessage($text);
+        if ($companyRequirement !== null) {
+            return $companyRequirement;
+        }
+
         // Mensagens no formato "Produto ... -> Atenção: ...": remove preâmbulo e deduplica restrições.
         $restrictions = $this->extractDistinctHandmaisRestrictions($text);
         if (! empty($restrictions)) {
@@ -1080,6 +1085,34 @@ class ConsultaHandmaisController extends Controller
         }
 
         return $this->truncate($text, 500);
+    }
+
+    private function extractCompanyRequirementMessage(string $text): ?string
+    {
+        $patterns = [
+            '/A empresa\s+[0-9\.\-\/]{8,20}\s+n(?:a|\x{00E3})o atende aos requisitos m(?:i|\x{00ED})nimos(?:[^.;]*)/iu',
+            '/A empresa\s+[^,;:.]{2,120}\s+n(?:a|\x{00E3})o atende aos requisitos m(?:i|\x{00ED})nimos(?:[^.;]*)/iu',
+        ];
+
+        foreach ($patterns as $pattern) {
+            $matches = [];
+            if (preg_match($pattern, $text, $matches) !== 1) {
+                continue;
+            }
+
+            $message = trim((string) ($matches[0] ?? ''));
+            if ($message === '') {
+                continue;
+            }
+
+            $message = preg_replace('/\s+/', ' ', $message) ?? $message;
+            $message = rtrim($message, " .,;\t\n\r\0\x0B");
+            if ($message !== '') {
+                return $this->truncate($message.'.', 500);
+            }
+        }
+
+        return null;
     }
 
     private function extractDistinctHandmaisRestrictions(string $text): array
