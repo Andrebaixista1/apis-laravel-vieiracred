@@ -1456,7 +1456,8 @@ class ConsultaHandmaisController extends Controller
                 [token_tabela] = ?,
                 [id_user] = ?,
                 [equipe_id] = ?,
-                [id_consulta_hand] = ?
+                [id_consulta_hand] = ?,
+                [updated_at] = SYSDATETIME()
             WHERE [id] = ?
         ", [
             $payload['nome'] ?? '',
@@ -1519,7 +1520,10 @@ class ConsultaHandmaisController extends Controller
     {
         DB::connection(self::DB_CONNECTION)->update("
             UPDATE [consultas_handmais].[dbo].[consulta_handmais]
-            SET [status] = 'Processando', [descricao] = NULL
+            SET
+                [status] = 'Processando',
+                [descricao] = NULL,
+                [updated_at] = SYSDATETIME()
             WHERE [id] = ?
         ", [$id]);
     }
@@ -1534,7 +1538,8 @@ class ConsultaHandmaisController extends Controller
             SET
                 [status] = 'Erro',
                 [descricao] = ?,
-                [valor_margem] = ?
+                [valor_margem] = ?,
+                [updated_at] = SYSDATETIME()
             WHERE [id] = ?
         ", [
             $this->truncate($message, 3900),
