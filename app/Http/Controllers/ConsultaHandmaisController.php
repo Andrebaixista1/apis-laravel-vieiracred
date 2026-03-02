@@ -21,6 +21,13 @@ class ConsultaHandmaisController extends Controller
     private const APPROVAL_SERVICE_TIMEOUT_SECONDS = 120;
     private const APPROVAL_TIMEOUT_SECONDS = 90;
 
+    private const COL_NOME_MAX = 100;
+    private const COL_STATUS_MAX = 20;
+    private const COL_NOME_TABELA_MAX = 10;
+    private const COL_VALOR_MARGEM_MAX = 15;
+    private const COL_ID_TABELA_MAX = 150;
+    private const COL_TOKEN_TABELA_MAX = 150;
+
     public function run(Request $request): JsonResponse
     {
         $lock = cache()->lock('consulta-handmais-manual-run', 3600);
@@ -408,11 +415,11 @@ class ConsultaHandmaisController extends Controller
         }
 
         return [
-            'nome' => mb_substr($nome, 0, 255),
+            'nome' => $this->fitConsultaField($nome, self::COL_NOME_MAX) ?? '',
             'cpf' => $cpf,
             'telefone' => mb_substr($telefone, 0, 20),
             'dataNascimento' => $dataNascimento,
-            'status' => 'Pendente',
+            'status' => $this->fitConsultaField('Pendente', self::COL_STATUS_MAX) ?? 'Pendente',
             'descricao' => null,
             'nome_tabela' => null,
             'valor_margem' => null,
@@ -1065,10 +1072,10 @@ class ConsultaHandmaisController extends Controller
             }
 
             $entries[] = [
-                'nome_tabela' => mb_substr($nomeTabela, 0, 255),
-                'valor_margem' => mb_substr($valorMargem, 0, 255),
-                'id_tabela' => mb_substr($idTabela, 0, 255),
-                'token_tabela' => mb_substr($tokenTabela, 0, 255),
+                'nome_tabela' => $this->fitConsultaField($nomeTabela, self::COL_NOME_TABELA_MAX),
+                'valor_margem' => $this->fitConsultaField($valorMargem, self::COL_VALOR_MARGEM_MAX),
+                'id_tabela' => $this->fitConsultaField($idTabela, self::COL_ID_TABELA_MAX),
+                'token_tabela' => $this->fitConsultaField($tokenTabela, self::COL_TOKEN_TABELA_MAX),
             ];
         }
 
@@ -1263,15 +1270,13 @@ class ConsultaHandmaisController extends Controller
             }
 
             $matricula = trim((string) ($row['matricula'] ?? $fallbackMatricula));
-            $nomeTabela = $matricula !== ''
-                ? 'Matricula '.$matricula
-                : 'Matricula HandMais';
+            $nomeTabela = 'Matricula';
 
             $entries[] = [
-                'nome_tabela' => mb_substr($nomeTabela, 0, 255),
-                'valor_margem' => number_format($valor, 2, '.', ''),
-                'id_tabela' => mb_substr($matricula, 0, 255),
-                'token_tabela' => '',
+                'nome_tabela' => $this->fitConsultaField($nomeTabela, self::COL_NOME_TABELA_MAX),
+                'valor_margem' => $this->fitConsultaField(number_format($valor, 2, '.', ''), self::COL_VALOR_MARGEM_MAX),
+                'id_tabela' => $this->fitConsultaField($matricula, self::COL_ID_TABELA_MAX),
+                'token_tabela' => null,
             ];
         }
 
@@ -1301,10 +1306,10 @@ class ConsultaHandmaisController extends Controller
 
             $seen[$key] = true;
             $target[] = [
-                'nome_tabela' => mb_substr($nomeTabela, 0, 255),
-                'valor_margem' => mb_substr($valorMargem, 0, 255),
-                'id_tabela' => mb_substr($idTabela, 0, 255),
-                'token_tabela' => mb_substr($tokenTabela, 0, 255),
+                'nome_tabela' => $this->fitConsultaField($nomeTabela, self::COL_NOME_TABELA_MAX),
+                'valor_margem' => $this->fitConsultaField($valorMargem, self::COL_VALOR_MARGEM_MAX),
+                'id_tabela' => $this->fitConsultaField($idTabela, self::COL_ID_TABELA_MAX),
+                'token_tabela' => $this->fitConsultaField($tokenTabela, self::COL_TOKEN_TABELA_MAX),
             ];
         }
     }
@@ -1581,7 +1586,7 @@ class ConsultaHandmaisController extends Controller
         }
         $name = preg_replace('/\s+/', ' ', $name) ?? $name;
 
-        return mb_substr(trim($name), 0, 255);
+        return mb_substr(trim($name), 0, self::COL_NOME_MAX);
     }
 
     private function toBirthDate($value): string
@@ -1635,6 +1640,20 @@ class ConsultaHandmaisController extends Controller
         return json_last_error() === JSON_ERROR_NONE ? $decoded : null;
     }
 
+
+    private function fitConsultaField($value, int $max): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $text = trim($this->toSafeString($value));
+        if ($text === '') {
+            return null;
+        }
+
+        return mb_substr($text, 0, max(1, $max));
+    }
 
     private function toNullableFloat($value): ?float
     {
