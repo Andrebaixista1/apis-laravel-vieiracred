@@ -1505,10 +1505,12 @@ class ConsultaHandmaisController extends Controller
                 [token_tabela],
                 [id_user],
                 [equipe_id],
-                [id_consulta_hand]
+                [id_consulta_hand],
+                [created_at],
+                [updated_at]
             )
             OUTPUT INSERTED.[id] AS [id]
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSDATETIME(), SYSDATETIME())
         ", [
             $payload['nome'] ?? '',
             $payload['cpf'] ?? '',
