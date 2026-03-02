@@ -1355,11 +1355,13 @@ class ConsultaHandmaisController extends Controller
         }
 
         if (empty($matriculas)) {
-            return $this->extractEntriesFromMarginRows($rows);
+            $baseDescription = $this->extractFailureMessage($simulacao['status'] ?? 0, $payload, (string) ($simulacao['raw'] ?? ''));
+            return $this->extractEntriesFromMarginRows($rows, '', $baseDescription);
         }
 
         $merged = [];
         $seen = [];
+        $retryDescriptions = [];
 
         foreach (array_keys($matriculas) as $matricula) {
             $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
@@ -1373,16 +1375,97 @@ class ConsultaHandmaisController extends Controller
                 $retryRows = $this->extractHandmaisMarginRows(is_array($retryPayload) ? ($retryPayload['mensagem'] ?? null) : null);
                 $entries = $this->extractEntriesFromMarginRows($retryRows, $matricula, $retryDescription);
             }
+            if ($retryDescription !== '') {
+                $retryDescriptions[] = $retryDescription;
+                $entries = $this->applyFallbackDescriptionToEntries($entries, $retryDescription);
+            }
 
             $this->appendUniqueHandmaisEntries($merged, $seen, $entries);
         }
 
+        $mergedRetryDescription = $this->mergeHandmaisDescriptions($retryDescriptions);
+        if (! empty($merged)) {
+            return $this->applyFallbackDescriptionToEntries($merged, $mergedRetryDescription);
+        }
+
         if (empty($merged)) {
-            $baseDescription = $this->extractFailureMessage($simulacao['status'] ?? 0, $payload, (string) ($simulacao['raw'] ?? ''));
+            $baseDescription = $mergedRetryDescription !== ''
+                ? $mergedRetryDescription
+                : $this->extractFailureMessage($simulacao['status'] ?? 0, $payload, (string) ($simulacao['raw'] ?? ''));
             $merged = $this->extractEntriesFromMarginRows($rows, '', $baseDescription);
         }
 
         return $merged;
+    }
+
+    private function applyFallbackDescriptionToEntries(array $entries, string $fallbackDescription): array
+    {
+        $fallback = $this->truncate(trim($fallbackDescription), 3900);
+        if ($fallback === '') {
+            return $entries;
+        }
+
+        foreach ($entries as $idx => $entry) {
+            if (! is_array($entry)) {
+                continue;
+            }
+
+            $current = trim($this->toSafeString($entry['descricao'] ?? ''));
+            if ($current !== '') {
+                continue;
+            }
+
+            $entries[$idx]['descricao'] = $fallback;
+        }
+
+        return $entries;
+    }
+
+    private function mergeHandmaisDescriptions(array $messages): string
+    {
+        $restrictions = [];
+        $genericMessages = [];
+
+        foreach ($messages as $message) {
+            $normalized = $this->normalizeHandmaisFailureMessage((string) $message);
+            $normalized = trim($normalized);
+            if ($normalized === '') {
+                continue;
+            }
+
+            $items = $this->extractDistinctHandmaisRestrictions($normalized);
+            if (! empty($items)) {
+                foreach ($items as $item) {
+                    $clean = trim((string) $item);
+                    if ($clean === '') {
+                        continue;
+                    }
+
+                    $key = mb_strtolower(preg_replace('/\s+/', ' ', $clean) ?? $clean, 'UTF-8');
+                    if (isset($restrictions[$key])) {
+                        continue;
+                    }
+
+                    $restrictions[$key] = $clean;
+                }
+                continue;
+            }
+
+            $key = mb_strtolower(preg_replace('/\s+/', ' ', $normalized) ?? $normalized, 'UTF-8');
+            if (! isset($genericMessages[$key])) {
+                $genericMessages[$key] = $normalized;
+            }
+        }
+
+        if (! empty($restrictions)) {
+            return $this->truncate(implode(', ', array_values($restrictions)).'.', 3900);
+        }
+
+        if (! empty($genericMessages)) {
+            return $this->truncate(implode(' | ', array_values($genericMessages)), 3900);
+        }
+
+        return '';
     }
 
     private function extractEntriesFromMarginRows(array $rows, string $fallbackMatricula = '', ?string $descricao = null): array
