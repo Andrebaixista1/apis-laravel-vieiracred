@@ -885,7 +885,8 @@ class ConsultaHandmaisController extends Controller
 
     private function buildPendingApprovalMessage(string $url = ''): string
     {
-        $message = 'A autorizacao digital da HandMais ainda esta pendente. Abra o link e conclua a autorizacao para liberar a consulta.';
+        $message = 'Nao foi possivel validar seus dados informados. Verifique as informacoes e tente novamente.';
+        $message .= ' A autorizacao digital da HandMais ainda esta pendente. Abra o link e conclua a autorizacao para liberar a consulta.';
         $cleanUrl = trim($url);
         if ($cleanUrl !== '') {
             $message .= ' Link: '.$cleanUrl;
@@ -968,9 +969,37 @@ class ConsultaHandmaisController extends Controller
         }
 
         if (! $this->approveHandmaisLinkViaForm($url, $person)) {
-            $suffix = ! empty($headlessErrors) ? ' Detalhe: '.$this->truncate(implode(' | ', $headlessErrors), 1600) : '';
-            throw new \RuntimeException('Falha na aprovacao automatica HandMais.'.$suffix);
+            throw new \RuntimeException($this->buildApprovalFailureMessage($headlessErrors));
         }
+    }
+
+    private function buildApprovalFailureMessage(array $headlessErrors): string
+    {
+        $detailsRaw = trim(implode(' | ', array_filter($headlessErrors, static fn ($v): bool => trim((string) $v) !== '')));
+        $detailsLower = mb_strtolower($detailsRaw, 'UTF-8');
+
+        $messages = [
+            'Nao foi possivel validar seus dados informados. Verifique as informacoes e tente novamente.',
+        ];
+
+        if ($detailsLower !== '') {
+            if (str_contains($detailsLower, 'existing_auth') || str_contains($detailsLower, 'ja existe autorizacao vinculada ao numero de telefone')) {
+                $messages[] = 'Ja existe uma autorizacao vinculada ao telefone informado.';
+            } elseif (str_contains($detailsLower, 'validar seus dados informados')) {
+                $messages[] = 'Os dados informados nao passaram na validacao da UY3.';
+            } elseif (
+                str_contains($detailsLower, 'browsertype.launch')
+                || str_contains($detailsLower, 'headless http_500')
+                || str_contains($detailsLower, 'curl error 7')
+                || str_contains($detailsLower, 'could not resolve host')
+            ) {
+                $messages[] = 'O servico de autorizacao esta instavel no momento.';
+            }
+
+            $messages[] = 'Detalhe tecnico: '.$this->truncate($detailsRaw, 1500);
+        }
+
+        return $this->truncate(implode(' ', array_unique($messages)), 3900);
     }
 
     private function summarizeApprovalServicePayload(array $payload, string $fallbackRaw = ''): string
