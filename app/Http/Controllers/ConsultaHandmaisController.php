@@ -941,8 +941,14 @@ class ConsultaHandmaisController extends Controller
 
                 if ($response->successful()) {
                     $payload = $this->decodeJson((string) $response->body());
-                    if (is_array($payload) && (bool) ($payload['ok'] ?? $payload['success'] ?? false)) {
-                        return;
+                    if (is_array($payload)) {
+                        $ok = (bool) ($payload['ok'] ?? $payload['success'] ?? false);
+                        $hasPositiveSignal = (bool) ($payload['details']['hasPositiveSignal'] ?? true);
+                        if ($ok && $hasPositiveSignal) {
+                            return;
+                        }
+                        $headlessErrors[] = '['.$serviceUrl.'] '.$this->summarizeApprovalServicePayload($payload, (string) $response->body());
+                        continue;
                     }
                     $headlessErrors[] = '['.$serviceUrl.'] '.$this->truncate((string) $response->body(), 700);
                     continue;
@@ -958,6 +964,61 @@ class ConsultaHandmaisController extends Controller
             $suffix = ! empty($headlessErrors) ? ' Detalhe: '.$this->truncate(implode(' | ', $headlessErrors), 1600) : '';
             throw new \RuntimeException('Falha na aprovacao automatica HandMais.'.$suffix);
         }
+    }
+
+    private function summarizeApprovalServicePayload(array $payload, string $fallbackRaw = ''): string
+    {
+        $parts = [];
+
+        $topMessage = trim($this->toSafeString($payload['error'] ?? $payload['message'] ?? ''));
+        if ($topMessage !== '') {
+            $parts[] = $topMessage;
+        }
+
+        $details = $payload['details'] ?? null;
+        if (is_array($details)) {
+            if (array_key_exists('hasPositiveSignal', $details)) {
+                $parts[] = ((bool) $details['hasPositiveSignal']) ? 'hasPositiveSignal=true' : 'hasPositiveSignal=false';
+            }
+
+            $call = null;
+            if (isset($details['challengeCall']) && is_array($details['challengeCall'])) {
+                $call = $details['challengeCall'];
+            } elseif (isset($details['lastCall']) && is_array($details['lastCall'])) {
+                $call = $details['lastCall'];
+            }
+
+            if (is_array($call)) {
+                $status = (int) ($call['status'] ?? 0);
+                if ($status > 0) {
+                    $parts[] = 'status='.$status;
+                }
+
+                $callBody = trim($this->toSafeString($call['body'] ?? ''));
+                if ($callBody !== '') {
+                    $decoded = $this->decodeJson($callBody);
+                    if (is_array($decoded)) {
+                        $code = trim($this->toSafeString($decoded['code'] ?? ''));
+                        $message = trim($this->toSafeString($decoded['message'] ?? ''));
+                        if ($code !== '') {
+                            $parts[] = 'code='.$code;
+                        }
+                        if ($message !== '') {
+                            $parts[] = $message;
+                        }
+                    } else {
+                        $parts[] = $this->truncate($callBody, 220);
+                    }
+                }
+            }
+        }
+
+        $parts = array_values(array_unique(array_filter($parts, static fn ($v): bool => trim((string) $v) !== '')));
+        if (empty($parts)) {
+            return $this->truncate($fallbackRaw, 700);
+        }
+
+        return $this->truncate(implode(' | ', $parts), 700);
     }
 
     private function approvalServiceUrls(): array
