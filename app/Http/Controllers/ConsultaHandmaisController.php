@@ -522,17 +522,17 @@ class ConsultaHandmaisController extends Controller
             $dailyLimit = $total > 0 ? $total : ($limite > 0 ? $limite : self::DAILY_DEFAULT_LIMIT);
             $consultados = max(0, (int) ($row->consultados ?? 0));
 
-            if ($dailyLimit > 0 && $consultados >= $dailyLimit) {
-                $updatedAt = $this->parseNullableCarbon($row->updated_at ?? null);
-                $canReset = $updatedAt === null || $updatedAt->lte($now->copy()->subHours(24));
-                if ($canReset) {
-                    DB::connection(self::DB_CONNECTION)->update("
-                        UPDATE [consultas_handmais].[dbo].[limites_handmais]
-                        SET [consultados] = 0, [updated_at] = SYSDATETIME()
-                        WHERE [id] = ?
-                    ", [$id]);
-                    $consultados = 0;
-                }
+            $updatedAt = $this->parseNullableCarbon($row->updated_at ?? null);
+            $canResetByWindow = $consultados > 0
+                && ($updatedAt === null || $updatedAt->lte($now->copy()->subHours(24)));
+
+            if ($canResetByWindow) {
+                DB::connection(self::DB_CONNECTION)->update("
+                    UPDATE [consultas_handmais].[dbo].[limites_handmais]
+                    SET [consultados] = 0, [updated_at] = SYSDATETIME()
+                    WHERE [id] = ?
+                ", [$id]);
+                $consultados = 0;
             }
 
             $remaining = max(0, $dailyLimit - $consultados);
