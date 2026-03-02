@@ -105,10 +105,15 @@ class ConsultaHandmaisController extends Controller
                         $result = $this->processPendingRow($pendingRow, $account);
                         $this->incrementConsultedCounter($accountId);
 
-                        $summary['processados']++;
-                        $summary['duplicados_criados'] += (int) ($result['duplicates_created'] ?? 0);
-                        $loginSummary['processados']++;
-                        $loginSummary['duplicados_criados'] += (int) ($result['duplicates_created'] ?? 0);
+                        if (($result['status'] ?? 'success') === 'error_handled') {
+                            $summary['erros']++;
+                            $loginSummary['erros']++;
+                        } else {
+                            $summary['processados']++;
+                            $summary['duplicados_criados'] += (int) ($result['duplicates_created'] ?? 0);
+                            $loginSummary['processados']++;
+                            $loginSummary['duplicados_criados'] += (int) ($result['duplicates_created'] ?? 0);
+                        }
                     } catch (\Throwable $e) {
                         $summary['erros']++;
                         $loginSummary['erros']++;
@@ -687,6 +692,21 @@ class ConsultaHandmaisController extends Controller
 
         $entries = $this->extractSuccessEntries($payload);
         if (empty($entries)) {
+            $marginConflict = $this->extractHandmaisMarginConflict($simulacao['status'], $payload, $simulacao['raw']);
+            if ($marginConflict !== null) {
+                $this->markPendingAsError(
+                    $pendingId,
+                    (string) ($marginConflict['descricao'] ?? 'Conflito na simulacao HandMais.'),
+                    (string) ($marginConflict['valor_margem'] ?? '0.00')
+                );
+
+                return [
+                    'entries_count' => 0,
+                    'duplicates_created' => 0,
+                    'status' => 'error_handled',
+                ];
+            }
+
             throw new \RuntimeException($this->extractFailureMessage($simulacao['status'], $payload, $simulacao['raw']));
         }
 
@@ -1039,8 +1059,129 @@ class ConsultaHandmaisController extends Controller
         return $entries;
     }
 
+
+    private function extractHandmaisMarginConflict(int $httpStatus, $payload, string $raw = ''): ?array
+    {
+        if (! is_array($payload)) {
+            return null;
+        }
+
+        $payloadHttpCode = (int) ($payload['http_code'] ?? 0);
+        if ($httpStatus !== 409 && $payloadHttpCode !== 409) {
+            return null;
+        }
+
+        $rows = $this->extractHandmaisMarginRows($payload['mensagem'] ?? null);
+        if (empty($rows)) {
+            return null;
+        }
+
+        $selected = $this->selectBestHandmaisMarginRow($rows);
+        if ($selected === null) {
+            return null;
+        }
+
+        $valor = (float) ($selected['valor'] ?? 0.0);
+
+        return [
+            'valor_margem' => number_format($valor, 2, '.', ''),
+            'descricao' => $this->buildHandmaisConflictDescriptionForLayperson($selected, count($rows)),
+        ];
+    }
+
+    private function extractHandmaisMarginRows($source): array
+    {
+        if (! is_array($source) || ! array_is_list($source)) {
+            return [];
+        }
+
+        $rows = [];
+        foreach ($source as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $value = $this->toNullableFloat($row['valorMargemDisponivel'] ?? $row['valor_margem'] ?? $row['valorMargem'] ?? null);
+            if ($value === null) {
+                continue;
+            }
+
+            $rows[] = [
+                'matricula' => trim($this->toSafeString($row['matricula'] ?? '')),
+                'nome' => trim($this->toSafeString($row['nome'] ?? '')),
+                'valor' => $value,
+            ];
+        }
+
+        return $rows;
+    }
+
+    private function selectBestHandmaisMarginRow(array $rows): ?array
+    {
+        if (empty($rows)) {
+            return null;
+        }
+
+        $positives = array_values(array_filter($rows, static fn (array $row): bool => (float) ($row['valor'] ?? 0.0) > 0));
+        if (! empty($positives)) {
+            usort($positives, static fn (array $a, array $b): int => ((float) $b['valor']) <=> ((float) $a['valor']));
+            return $positives[0];
+        }
+
+        $negatives = array_values(array_filter($rows, static fn (array $row): bool => (float) ($row['valor'] ?? 0.0) < 0));
+        if (! empty($negatives)) {
+            usort($negatives, static fn (array $a, array $b): int => ((float) $a['valor']) <=> ((float) $b['valor']));
+            return $negatives[0];
+        }
+
+        return $rows[0];
+    }
+
+    private function buildHandmaisConflictDescriptionForLayperson(array $row, int $totalRows): string
+    {
+        $valor = (float) ($row['valor'] ?? 0.0);
+        $valorFmt = $this->formatMoneyBR($valor);
+        $matricula = trim((string) ($row['matricula'] ?? ''));
+        $nome = trim((string) ($row['nome'] ?? ''));
+
+        $prefix = $totalRows > 1
+            ? 'A HandMais retornou mais de uma matricula para este CPF.'
+            : 'A HandMais retornou conflito de matricula para este CPF.';
+
+        if ($valor > 0) {
+            $message = $prefix.' A margem disponivel identificada foi '.$valorFmt.'.';
+        } elseif ($valor < 0) {
+            $message = $prefix.' A margem encontrada esta negativa em '.$valorFmt.', indicando margem comprometida no momento.';
+        } else {
+            $message = $prefix.' Nao ha margem disponivel no momento ('.$valorFmt.').';
+        }
+
+        if ($matricula !== '') {
+            $message .= ' Matricula considerada: '.$matricula.'.';
+        }
+
+        if ($nome !== '') {
+            $message .= ' Nome retornado: '.$nome.'.';
+        }
+
+        $message .= ' Confirme os dados da matricula junto ao RH/empresa para seguir com a simulacao.';
+
+        return $this->truncate($message, 3900);
+    }
+
+    private function formatMoneyBR(float $value): string
+    {
+        $prefix = $value < 0 ? '-R$ ' : 'R$ ';
+        return $prefix.number_format(abs($value), 2, ',', '.');
+    }
+
     private function extractFailureMessage(int $httpStatus, $payload, string $raw): string
     {
+        $marginConflict = $this->extractHandmaisMarginConflict($httpStatus, $payload, $raw);
+        if ($marginConflict !== null) {
+            return (string) ($marginConflict['descricao'] ?? 'Conflito na simulacao HandMais.');
+        }
+
         if (is_array($payload)) {
             $message = trim($this->toSafeString($payload['descricao'] ?? $payload['mensagem'] ?? $payload['message'] ?? $payload['error'] ?? ''));
             if ($message !== '') {
@@ -1249,17 +1390,21 @@ class ConsultaHandmaisController extends Controller
         ", [$id]);
     }
 
-    private function markPendingAsError(int $id, string $message): void
+    private function markPendingAsError(int $id, string $message, ?string $valorMargem = null): void
     {
+        $marginValue = $this->toNullableFloat($valorMargem);
+        $safeMargin = $marginValue === null ? '0.00' : number_format($marginValue, 2, '.', '');
+
         DB::connection(self::DB_CONNECTION)->update("
             UPDATE [consultas_handmais].[dbo].[consulta_handmais]
             SET
                 [status] = 'Erro',
                 [descricao] = ?,
-                [valor_margem] = '0.00'
+                [valor_margem] = ?
             WHERE [id] = ?
         ", [
             $this->truncate($message, 3900),
+            $safeMargin,
             $id,
         ]);
     }
@@ -1349,6 +1494,38 @@ class ConsultaHandmaisController extends Controller
 
         $decoded = json_decode($trimmed, true);
         return json_last_error() === JSON_ERROR_NONE ? $decoded : null;
+    }
+
+
+    private function toNullableFloat($value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (float) $value;
+        }
+
+        $text = trim((string) $value);
+        if ($text === '') {
+            return null;
+        }
+
+        $text = str_replace(['R$', ' '], '', $text);
+
+        if (str_contains($text, ',') && str_contains($text, '.')) {
+            $text = str_replace('.', '', $text);
+            $text = str_replace(',', '.', $text);
+        } elseif (str_contains($text, ',')) {
+            $text = str_replace(',', '.', $text);
+        }
+
+        if (! is_numeric($text)) {
+            return null;
+        }
+
+        return (float) $text;
     }
 
     private function toNullableInt($value): ?int
