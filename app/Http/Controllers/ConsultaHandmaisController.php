@@ -737,7 +737,7 @@ class ConsultaHandmaisController extends Controller
             'telefone' => $telefone,
             'dataNascimento' => $dataNascimento,
             'status' => 'Consultado',
-            'descricao' => null,
+            'descricao' => $first['descricao'] ?? null,
             'nome_tabela' => $first['nome_tabela'],
             'valor_margem' => $first['valor_margem'],
             'id_tabela' => $first['id_tabela'],
@@ -755,7 +755,7 @@ class ConsultaHandmaisController extends Controller
                 'telefone' => $telefone,
                 'dataNascimento' => $dataNascimento,
                 'status' => 'Consultado',
-                'descricao' => null,
+                'descricao' => $entries[$i]['descricao'] ?? null,
                 'nome_tabela' => $entries[$i]['nome_tabela'],
                 'valor_margem' => $entries[$i]['valor_margem'],
                 'id_tabela' => $entries[$i]['id_tabela'],
@@ -1076,6 +1076,7 @@ class ConsultaHandmaisController extends Controller
                 'valor_margem' => $this->fitConsultaField($valorMargem, self::COL_VALOR_MARGEM_MAX),
                 'id_tabela' => $this->fitConsultaField($idTabela, self::COL_ID_TABELA_MAX),
                 'token_tabela' => $this->fitConsultaField($tokenTabela, self::COL_TOKEN_TABELA_MAX),
+                'descricao' => $this->truncate($descricao, 3900) ?: null,
             ];
         }
 
@@ -1229,6 +1230,7 @@ class ConsultaHandmaisController extends Controller
         foreach (array_keys($matriculas) as $matricula) {
             $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
             $retryPayload = $retry['payload'];
+            $retryDescription = '';
 
             if ($this->isApprovalRequired($retry['status'], $retryPayload)) {
                 $approvalUrl = $this->extractApprovalUrl($retryPayload);
@@ -1242,21 +1244,23 @@ class ConsultaHandmaisController extends Controller
 
             $entries = $this->extractSuccessEntries($retryPayload);
             if (empty($entries)) {
+                $retryDescription = $this->extractFailureMessage($retry['status'], $retryPayload, $retry['raw']);
                 $retryRows = $this->extractHandmaisMarginRows(is_array($retryPayload) ? ($retryPayload['mensagem'] ?? null) : null);
-                $entries = $this->extractEntriesFromMarginRows($retryRows, $matricula);
+                $entries = $this->extractEntriesFromMarginRows($retryRows, $matricula, $retryDescription);
             }
 
             $this->appendUniqueHandmaisEntries($merged, $seen, $entries);
         }
 
         if (empty($merged)) {
-            $merged = $this->extractEntriesFromMarginRows($rows);
+            $baseDescription = $this->extractFailureMessage($simulacao['status'] ?? 0, $payload, (string) ($simulacao['raw'] ?? ''));
+            $merged = $this->extractEntriesFromMarginRows($rows, '', $baseDescription);
         }
 
         return $merged;
     }
 
-    private function extractEntriesFromMarginRows(array $rows, string $fallbackMatricula = ''): array
+    private function extractEntriesFromMarginRows(array $rows, string $fallbackMatricula = '', ?string $descricao = null): array
     {
         $entries = [];
         foreach ($rows as $row) {
@@ -1277,6 +1281,7 @@ class ConsultaHandmaisController extends Controller
                 'valor_margem' => $this->fitConsultaField(number_format($valor, 2, '.', ''), self::COL_VALOR_MARGEM_MAX),
                 'id_tabela' => $this->fitConsultaField($matricula, self::COL_ID_TABELA_MAX),
                 'token_tabela' => null,
+                'descricao' => $this->truncate((string) ($descricao ?? ''), 3900) ?: null,
             ];
         }
 
@@ -1294,12 +1299,13 @@ class ConsultaHandmaisController extends Controller
             $valorMargem = trim($this->toSafeString($entry['valor_margem'] ?? ''));
             $idTabela = trim($this->toSafeString($entry['id_tabela'] ?? ''));
             $tokenTabela = trim($this->toSafeString($entry['token_tabela'] ?? ''));
+            $descricao = trim($this->toSafeString($entry['descricao'] ?? ''));
 
             if ($nomeTabela === '' && $valorMargem === '' && $idTabela === '' && $tokenTabela === '') {
                 continue;
             }
 
-            $key = mb_strtolower($nomeTabela.'|'.$valorMargem.'|'.$idTabela.'|'.$tokenTabela, 'UTF-8');
+            $key = mb_strtolower($nomeTabela.'|'.$valorMargem.'|'.$idTabela.'|'.$tokenTabela.'|'.$descricao, 'UTF-8');
             if (isset($seen[$key])) {
                 continue;
             }
