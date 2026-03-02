@@ -677,23 +677,22 @@ class ConsultaHandmaisController extends Controller
             throw new \RuntimeException('Token API do limite HandMais nao informado.');
         }
 
-        $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf);
-        $simulacao = $this->retrySimulacaoAfterApproval($tokenApi, $cpf, null, [
+        $person = [
             'nome' => $nome,
             'cpf' => $cpf,
             'telefone' => $telefone,
             'dataNascimento' => $dataNascimento,
-        ], $simulacao);
+        ];
+
+        $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf);
+        $simulacao = $this->retrySimulacaoAfterApproval($tokenApi, $cpf, null, $person, $simulacao);
+        $telefone = (string) ($person['telefone'] ?? $telefone);
         $payload = $simulacao['payload'];
 
         $entries = $this->extractSuccessEntries($payload);
         if (empty($entries)) {
-            $entries = $this->resolveEntriesFromConflictMatriculas($tokenApi, $cpf, $simulacao, [
-                'nome' => $nome,
-                'cpf' => $cpf,
-                'telefone' => $telefone,
-                'dataNascimento' => $dataNascimento,
-            ]);
+            $entries = $this->resolveEntriesFromConflictMatriculas($tokenApi, $cpf, $simulacao, $person);
+            $telefone = (string) ($person['telefone'] ?? $telefone);
         }
 
         if (empty($entries)) {
@@ -895,7 +894,7 @@ class ConsultaHandmaisController extends Controller
         return $this->truncate($message, 3900);
     }
 
-    private function retrySimulacaoAfterApproval(string $tokenApi, string $cpf, ?string $matricula, array $person, array $simulacao): array
+    private function retrySimulacaoAfterApproval(string $tokenApi, string $cpf, ?string $matricula, array &$person, array $simulacao): array
     {
         $maxAttempts = 3;
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
@@ -911,7 +910,17 @@ class ConsultaHandmaisController extends Controller
                 throw new \RuntimeException('API informou aprovacao pendente, mas sem URL valida.');
             }
 
-            $this->approveHandmaisLink($approvalUrl, $person);
+            try {
+                $this->approveHandmaisLink($approvalUrl, $person);
+            } catch (\RuntimeException $e) {
+                if ($attempt < $maxAttempts && $this->shouldRetryApprovalWithNewPhone($e->getMessage())) {
+                    $person['telefone'] = $this->generateRandomPhoneNumberInRange();
+                    continue;
+                }
+
+                throw $e;
+            }
+
             $this->sleepSeconds(self::RETRY_AFTER_APPROVAL_SECONDS);
             $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf, (string) ($matricula ?? ''));
         }
@@ -1000,6 +1009,19 @@ class ConsultaHandmaisController extends Controller
         }
 
         return $this->truncate(implode(' ', array_unique($messages)), 3900);
+    }
+
+    private function shouldRetryApprovalWithNewPhone(string $message): bool
+    {
+        $text = mb_strtolower(trim($message), 'UTF-8');
+        if ($text === '') {
+            return false;
+        }
+
+        return str_contains($text, 'existing_auth')
+            || str_contains($text, 'ja existe uma autorizacao vinculada ao telefone informado')
+            || str_contains($text, 'ja existe autorizacao vinculada ao numero de telefone')
+            || str_contains($text, 'já existe autorização vinculada ao número de telefone');
     }
 
     private function summarizeApprovalServicePayload(array $payload, string $fallbackRaw = ''): string
@@ -1369,7 +1391,7 @@ class ConsultaHandmaisController extends Controller
         return $prefix.number_format(abs($value), 2, ',', '.');
     }
 
-    private function resolveEntriesFromConflictMatriculas(string $tokenApi, string $cpf, array $simulacao, array $person): array
+    private function resolveEntriesFromConflictMatriculas(string $tokenApi, string $cpf, array $simulacao, array &$person): array
     {
         $payload = $simulacao['payload'] ?? null;
         if (! is_array($payload)) {
@@ -1912,12 +1934,25 @@ class ConsultaHandmaisController extends Controller
             return false;
         }
 
+        if (substr($digits, 2, 1) !== '9') {
+            return false;
+        }
+
         return $digits >= '11911111111' && $digits <= '99999999999';
     }
 
     private function generateRandomPhoneNumberInRange(): string
     {
-        return (string) random_int(11911111111, 99999999999);
+        for ($i = 0; $i < 50; $i++) {
+            $ddd = (int) random_int(11, 99);
+            $suffix = str_pad((string) random_int(0, 99999999), 8, '0', STR_PAD_LEFT);
+            $phone = (string) $ddd.'9'.$suffix;
+            if ($this->isValidBrazilCellPhoneInRange($phone)) {
+                return $phone;
+            }
+        }
+
+        return '11991111111';
     }
 
     private function parseNullableCarbon($value): ?Carbon
