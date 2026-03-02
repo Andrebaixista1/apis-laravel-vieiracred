@@ -677,25 +677,13 @@ class ConsultaHandmaisController extends Controller
         }
 
         $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf);
+        $simulacao = $this->retrySimulacaoAfterApproval($tokenApi, $cpf, null, [
+            'nome' => $nome,
+            'cpf' => $cpf,
+            'telefone' => $telefone,
+            'dataNascimento' => $dataNascimento,
+        ], $simulacao);
         $payload = $simulacao['payload'];
-
-        if ($this->isApprovalRequired($simulacao['status'], $payload)) {
-            $approvalUrl = $this->extractApprovalUrl($payload);
-            if ($approvalUrl === '') {
-                throw new \RuntimeException('API informou aprovacao pendente, mas sem URL valida.');
-            }
-
-            $this->approveHandmaisLink($approvalUrl, [
-                'nome' => $nome,
-                'cpf' => $cpf,
-                'telefone' => $telefone,
-                'dataNascimento' => $dataNascimento,
-            ]);
-
-            $this->sleepSeconds(self::RETRY_AFTER_APPROVAL_SECONDS);
-            $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf);
-            $payload = $simulacao['payload'];
-        }
 
         $entries = $this->extractSuccessEntries($payload);
         if (empty($entries)) {
@@ -818,8 +806,7 @@ class ConsultaHandmaisController extends Controller
             return true;
         }
 
-        $message = trim($this->toSafeString($payload['mensagem'] ?? ''));
-        return $message !== '' && preg_match('/^https?:\\/\\//i', $message) === 1;
+        return $this->extractApprovalUrl($payload) !== '';
     }
 
     private function extractApprovalUrl($payload): string
@@ -830,18 +817,104 @@ class ConsultaHandmaisController extends Controller
 
         $candidates = [
             $payload['mensagem'] ?? null,
+            $payload['descricao'] ?? null,
+            $payload['message'] ?? null,
+            $payload['error'] ?? null,
             $payload['url'] ?? null,
             $payload['link'] ?? null,
         ];
 
         foreach ($candidates as $candidate) {
-            $url = trim($this->toSafeString($candidate));
-            if ($url !== '' && preg_match('/^https?:\\/\\//i', $url) === 1) {
+            $url = $this->extractFirstUrl($this->toSafeString($candidate));
+            if ($this->isApprovalUrl($url)) {
+                return $url;
+            }
+        }
+
+        $serialized = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($serialized) && $serialized !== '') {
+            $url = $this->extractFirstUrl($serialized);
+            if ($this->isApprovalUrl($url)) {
                 return $url;
             }
         }
 
         return '';
+    }
+
+    private function extractFirstUrl(string $text): string
+    {
+        $cleanText = trim((string) $text);
+        if ($cleanText === '') {
+            return '';
+        }
+
+        if (preg_match('/https?:\/\/[^\s<>"\']+/iu', $cleanText, $matches) !== 1) {
+            return '';
+        }
+
+        $url = trim((string) ($matches[0] ?? ''));
+        if ($url === '') {
+            return '';
+        }
+
+        return rtrim($url, ".,;:)]}");
+    }
+
+    private function isApprovalUrl(string $url): bool
+    {
+        $clean = trim($url);
+        if ($clean === '') {
+            return false;
+        }
+
+        $lower = mb_strtolower($clean, 'UTF-8');
+        if (! str_contains($lower, 'autorizacao-clt')) {
+            return false;
+        }
+
+        return str_contains($lower, '/info.html');
+    }
+
+    private function buildPendingApprovalMessage(string $url = ''): string
+    {
+        $message = 'A autorizacao digital da HandMais ainda esta pendente. Abra o link e conclua a autorizacao para liberar a consulta.';
+        $cleanUrl = trim($url);
+        if ($cleanUrl !== '') {
+            $message .= ' Link: '.$cleanUrl;
+        }
+
+        return $this->truncate($message, 3900);
+    }
+
+    private function retrySimulacaoAfterApproval(string $tokenApi, string $cpf, ?string $matricula, array $person, array $simulacao): array
+    {
+        $maxAttempts = 3;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $payload = $simulacao['payload'] ?? null;
+            $status = (int) ($simulacao['status'] ?? 0);
+
+            if (! $this->isApprovalRequired($status, $payload)) {
+                return $simulacao;
+            }
+
+            $approvalUrl = $this->extractApprovalUrl($payload);
+            if ($approvalUrl === '') {
+                throw new \RuntimeException('API informou aprovacao pendente, mas sem URL valida.');
+            }
+
+            $this->approveHandmaisLink($approvalUrl, $person);
+            $this->sleepSeconds(self::RETRY_AFTER_APPROVAL_SECONDS);
+            $simulacao = $this->callHandmaisSimulacao($tokenApi, $cpf, (string) ($matricula ?? ''));
+        }
+
+        $payload = $simulacao['payload'] ?? null;
+        if ($this->isApprovalRequired((int) ($simulacao['status'] ?? 0), $payload)) {
+            $approvalUrl = $this->extractApprovalUrl($payload);
+            throw new \RuntimeException($this->buildPendingApprovalMessage($approvalUrl));
+        }
+
+        return $simulacao;
     }
 
     private function approveHandmaisLink(string $url, array $person): void
@@ -1229,18 +1302,9 @@ class ConsultaHandmaisController extends Controller
 
         foreach (array_keys($matriculas) as $matricula) {
             $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
+            $retry = $this->retrySimulacaoAfterApproval($tokenApi, $cpf, $matricula, $person, $retry);
             $retryPayload = $retry['payload'];
             $retryDescription = '';
-
-            if ($this->isApprovalRequired($retry['status'], $retryPayload)) {
-                $approvalUrl = $this->extractApprovalUrl($retryPayload);
-                if ($approvalUrl !== '') {
-                    $this->approveHandmaisLink($approvalUrl, $person);
-                    $this->sleepSeconds(self::RETRY_AFTER_APPROVAL_SECONDS);
-                    $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
-                    $retryPayload = $retry['payload'];
-                }
-            }
 
             $entries = $this->extractSuccessEntries($retryPayload);
             if (empty($entries)) {
@@ -1331,6 +1395,10 @@ class ConsultaHandmaisController extends Controller
         if (is_array($payload)) {
             $message = trim($this->toSafeString($payload['descricao'] ?? $payload['mensagem'] ?? $payload['message'] ?? $payload['error'] ?? ''));
             if ($message !== '') {
+                $approvalUrl = $this->extractFirstUrl($message);
+                if ($this->isApprovalUrl($approvalUrl)) {
+                    return $this->buildPendingApprovalMessage($approvalUrl);
+                }
                 return $this->normalizeHandmaisFailureMessage($message);
             }
         }
