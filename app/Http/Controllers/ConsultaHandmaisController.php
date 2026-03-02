@@ -692,6 +692,15 @@ class ConsultaHandmaisController extends Controller
 
         $entries = $this->extractSuccessEntries($payload);
         if (empty($entries)) {
+            $entries = $this->resolveEntriesFromConflictMatriculas($tokenApi, $cpf, $simulacao, [
+                'nome' => $nome,
+                'cpf' => $cpf,
+                'telefone' => $telefone,
+                'dataNascimento' => $dataNascimento,
+            ]);
+        }
+
+        if (empty($entries)) {
             $marginConflict = $this->extractHandmaisMarginConflict($simulacao['status'], $payload, $simulacao['raw']);
             if ($marginConflict !== null) {
                 $this->markPendingAsError(
@@ -757,8 +766,17 @@ class ConsultaHandmaisController extends Controller
         ];
     }
 
-    private function callHandmaisSimulacao(string $tokenApi, string $cpf): array
+    private function callHandmaisSimulacao(string $tokenApi, string $cpf, ?string $matricula = null): array
     {
+        $body = [
+            'cpf' => $cpf,
+        ];
+
+        $matriculaValue = trim((string) $matricula);
+        if ($matriculaValue !== '') {
+            $body['matricula'] = $matriculaValue;
+        }
+
         $response = Http::timeout(self::HTTP_TIMEOUT_SECONDS)
             ->acceptJson()
             ->withHeaders([
@@ -766,9 +784,7 @@ class ConsultaHandmaisController extends Controller
                 'Content-Type' => 'application/json',
             ])
             ->asJson()
-            ->post(self::HANDMAIS_SIMULACAO_URL, [
-                'cpf' => $cpf,
-            ]);
+            ->post(self::HANDMAIS_SIMULACAO_URL, $body);
 
         $raw = (string) $response->body();
         $payload = $this->decodeJson($raw);
@@ -1173,6 +1189,124 @@ class ConsultaHandmaisController extends Controller
     {
         $prefix = $value < 0 ? '-R$ ' : 'R$ ';
         return $prefix.number_format(abs($value), 2, ',', '.');
+    }
+
+    private function resolveEntriesFromConflictMatriculas(string $tokenApi, string $cpf, array $simulacao, array $person): array
+    {
+        $payload = $simulacao['payload'] ?? null;
+        if (! is_array($payload)) {
+            return [];
+        }
+
+        $rows = $this->extractHandmaisMarginRows($payload['mensagem'] ?? null);
+        if (empty($rows)) {
+            return [];
+        }
+
+        $matriculas = [];
+        foreach ($rows as $row) {
+            $matricula = trim((string) ($row['matricula'] ?? ''));
+            if ($matricula === '' || isset($matriculas[$matricula])) {
+                continue;
+            }
+            $matriculas[$matricula] = true;
+        }
+
+        if (empty($matriculas)) {
+            return $this->extractEntriesFromMarginRows($rows);
+        }
+
+        $merged = [];
+        $seen = [];
+
+        foreach (array_keys($matriculas) as $matricula) {
+            $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
+            $retryPayload = $retry['payload'];
+
+            if ($this->isApprovalRequired($retry['status'], $retryPayload)) {
+                $approvalUrl = $this->extractApprovalUrl($retryPayload);
+                if ($approvalUrl !== '') {
+                    $this->approveHandmaisLink($approvalUrl, $person);
+                    $this->sleepSeconds(self::RETRY_AFTER_APPROVAL_SECONDS);
+                    $retry = $this->callHandmaisSimulacao($tokenApi, $cpf, $matricula);
+                    $retryPayload = $retry['payload'];
+                }
+            }
+
+            $entries = $this->extractSuccessEntries($retryPayload);
+            if (empty($entries)) {
+                $retryRows = $this->extractHandmaisMarginRows(is_array($retryPayload) ? ($retryPayload['mensagem'] ?? null) : null);
+                $entries = $this->extractEntriesFromMarginRows($retryRows, $matricula);
+            }
+
+            $this->appendUniqueHandmaisEntries($merged, $seen, $entries);
+        }
+
+        if (empty($merged)) {
+            $merged = $this->extractEntriesFromMarginRows($rows);
+        }
+
+        return $merged;
+    }
+
+    private function extractEntriesFromMarginRows(array $rows, string $fallbackMatricula = ''): array
+    {
+        $entries = [];
+        foreach ($rows as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $valor = $this->toNullableFloat($row['valor'] ?? $row['valorMargemDisponivel'] ?? $row['valor_margem'] ?? null);
+            if ($valor === null) {
+                continue;
+            }
+
+            $matricula = trim((string) ($row['matricula'] ?? $fallbackMatricula));
+            $nomeTabela = $matricula !== ''
+                ? 'Matricula '.$matricula
+                : 'Matricula HandMais';
+
+            $entries[] = [
+                'nome_tabela' => mb_substr($nomeTabela, 0, 255),
+                'valor_margem' => number_format($valor, 2, '.', ''),
+                'id_tabela' => mb_substr($matricula, 0, 255),
+                'token_tabela' => '',
+            ];
+        }
+
+        return $entries;
+    }
+
+    private function appendUniqueHandmaisEntries(array &$target, array &$seen, array $entries): void
+    {
+        foreach ($entries as $entry) {
+            if (! is_array($entry)) {
+                continue;
+            }
+
+            $nomeTabela = trim($this->toSafeString($entry['nome_tabela'] ?? ''));
+            $valorMargem = trim($this->toSafeString($entry['valor_margem'] ?? ''));
+            $idTabela = trim($this->toSafeString($entry['id_tabela'] ?? ''));
+            $tokenTabela = trim($this->toSafeString($entry['token_tabela'] ?? ''));
+
+            if ($nomeTabela === '' && $valorMargem === '' && $idTabela === '' && $tokenTabela === '') {
+                continue;
+            }
+
+            $key = mb_strtolower($nomeTabela.'|'.$valorMargem.'|'.$idTabela.'|'.$tokenTabela, 'UTF-8');
+            if (isset($seen[$key])) {
+                continue;
+            }
+
+            $seen[$key] = true;
+            $target[] = [
+                'nome_tabela' => mb_substr($nomeTabela, 0, 255),
+                'valor_margem' => mb_substr($valorMargem, 0, 255),
+                'id_tabela' => mb_substr($idTabela, 0, 255),
+                'token_tabela' => mb_substr($tokenTabela, 0, 255),
+            ];
+        }
     }
 
     private function extractFailureMessage(int $httpStatus, $payload, string $raw): string
