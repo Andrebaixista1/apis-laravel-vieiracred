@@ -1076,7 +1076,7 @@ class ConsultaHandmaisController extends Controller
                 'valor_margem' => $this->fitConsultaField($valorMargem, self::COL_VALOR_MARGEM_MAX),
                 'id_tabela' => $this->fitConsultaField($idTabela, self::COL_ID_TABELA_MAX),
                 'token_tabela' => $this->fitConsultaField($tokenTabela, self::COL_TOKEN_TABELA_MAX),
-                'descricao' => $this->truncate($descricao, 3900) ?: null,
+                'descricao' => null,
             ];
         }
 
@@ -1316,6 +1316,7 @@ class ConsultaHandmaisController extends Controller
                 'valor_margem' => $this->fitConsultaField($valorMargem, self::COL_VALOR_MARGEM_MAX),
                 'id_tabela' => $this->fitConsultaField($idTabela, self::COL_ID_TABELA_MAX),
                 'token_tabela' => $this->fitConsultaField($tokenTabela, self::COL_TOKEN_TABELA_MAX),
+                'descricao' => $this->truncate($descricao, 3900) ?: null,
             ];
         }
     }
