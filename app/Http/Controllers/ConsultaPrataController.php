@@ -20,7 +20,166 @@ class ConsultaPrataController extends Controller
 
     public function run(Request $request): JsonResponse
     {
-        return $this->consultar($request);
+        $idUserScope = $this->toIntOrNull($request->query('id_user', $request->input('id_user')));
+        $idEquipeScope = $this->toIntOrNull($request->query('id_equipe', $request->input('id_equipe')));
+        $limit = max(1, min((int) $request->query('limit', 20), 200));
+
+        if ($idUserScope !== null && $idUserScope <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_user invalido.',
+            ], 422);
+        }
+
+        if ($idEquipeScope !== null && $idEquipeScope <= 0) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'id_equipe invalido.',
+            ], 422);
+        }
+
+        $scopeKey = 'all';
+        if ($idUserScope !== null) {
+            $scopeKey = 'user_'.$idUserScope;
+            if ($idEquipeScope !== null) {
+                $scopeKey .= '_eq_'.$idEquipeScope;
+            }
+        } elseif ($idEquipeScope !== null) {
+            $scopeKey = 'eq_'.$idEquipeScope;
+        }
+
+        $lockKey = 'consulta-prata-manual-run:'.$scopeKey;
+        $lock = cache()->lock($lockKey, 3600);
+
+        if (! $lock->get()) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'Ja existe uma execucao em andamento para este escopo.',
+                'scope' => [
+                    'id_user' => $idUserScope,
+                    'id_equipe' => $idEquipeScope,
+                    'scope_key' => $scopeKey,
+                ],
+            ], 409);
+        }
+
+        $startedAt = microtime(true);
+        $summary = [
+            'ok' => true,
+            'started_at' => now()->toIso8601String(),
+            'finished_at' => null,
+            'duration_ms' => 0,
+            'scope' => [
+                'id_user' => $idUserScope,
+                'id_equipe' => $idEquipeScope,
+                'scope_key' => $scopeKey,
+            ],
+            'lock_key' => $lockKey,
+            'pendentes_encontrados' => 0,
+            'processados' => 0,
+            'erros' => 0,
+            'detalhes' => [],
+        ];
+
+        try {
+            $pendingRows = $this->loadPendingRows($limit, $idUserScope, $idEquipeScope);
+            $summary['pendentes_encontrados'] = count($pendingRows);
+
+            if (empty($pendingRows)) {
+                $summary['message'] = 'Nenhuma consulta pendente encontrada.';
+                $summary['finished_at'] = now()->toIso8601String();
+                $summary['duration_ms'] = (int) round((microtime(true) - $startedAt) * 1000);
+
+                return response()->json($summary);
+            }
+
+            foreach ($pendingRows as $row) {
+                $idConsultaPrata = $this->toIntOrNull($row->id_consulta_prata ?? null);
+                if ($idConsultaPrata === null || $idConsultaPrata <= 0) {
+                    $summary['erros']++;
+                    $summary['detalhes'][] = [
+                        'id_consulta_prata' => null,
+                        'ok' => false,
+                        'status' => 422,
+                        'message' => 'Registro pendente sem id_consulta_prata valido.',
+                    ];
+                    continue;
+                }
+
+                $name = $this->pickFirstText($row, [
+                    'nome',
+                    'name',
+                    'cliente_nome',
+                ]);
+                $document = $this->digitsOnly($this->pickFirstText($row, [
+                    'document',
+                    'cpf',
+                    'document_number',
+                    'numero_documento',
+                    'cliente_cpf',
+                ]));
+
+                if ($name === '' || strlen($document) !== 11) {
+                    $summary['erros']++;
+                    $summary['detalhes'][] = [
+                        'id_consulta_prata' => $idConsultaPrata,
+                        'ok' => false,
+                        'status' => 422,
+                        'message' => 'Pendente sem nome ou documento valido para consulta.',
+                    ];
+                    continue;
+                }
+
+                $payload = [
+                    'id_consulta_prata' => $idConsultaPrata,
+                    'name' => $name,
+                    'document' => $document,
+                    'email' => $this->pickFirstText($row, ['email', 'cliente_email']) ?: 'cliente@gmail.com',
+                    'number' => $this->digitsOnly($this->pickFirstText($row, ['number', 'telefone', 'phone'])) ?: '980733602',
+                    'area_code' => $this->digitsOnly($this->pickFirstText($row, ['area_code', 'ddd'])) ?: '11',
+                    'ip_address' => $this->pickFirstText($row, ['ip_address']) ?: '192.168.0.1',
+                    'lat' => $this->pickFirstText($row, ['lat']) ?: '-23.5505',
+                    'long' => $this->pickFirstText($row, ['long']) ?: '-46.6333',
+                    'model' => $this->pickFirstText($row, ['model']) ?: 'Mozilla/5.0',
+                ];
+
+                $childRequest = Request::create('/api/prata/consultar', 'POST', $payload);
+                $response = $this->consultar($childRequest);
+                $statusCode = $response->getStatusCode();
+                $responseBody = json_decode($response->getContent(), true);
+
+                $detail = [
+                    'id_consulta_prata' => $idConsultaPrata,
+                    'ok' => $statusCode >= 200 && $statusCode < 300,
+                    'status' => $statusCode,
+                    'message' => is_array($responseBody) ? ($responseBody['message'] ?? null) : null,
+                    'status_consulta' => is_array($responseBody) ? ($responseBody['status_consulta'] ?? null) : null,
+                ];
+                $summary['detalhes'][] = $detail;
+
+                if ($detail['ok']) {
+                    $summary['processados']++;
+                } else {
+                    $summary['erros']++;
+                }
+
+                usleep(200000);
+            }
+
+            $summary['finished_at'] = now()->toIso8601String();
+            $summary['duration_ms'] = (int) round((microtime(true) - $startedAt) * 1000);
+
+            return response()->json($summary);
+        } catch (\Throwable $e) {
+            $summary['ok'] = false;
+            $summary['message'] = $e->getMessage();
+            $summary['finished_at'] = now()->toIso8601String();
+            $summary['duration_ms'] = (int) round((microtime(true) - $startedAt) * 1000);
+
+            return response()->json($summary, 500);
+        } finally {
+            optional($lock)->release();
+        }
     }
 
     public function consultar(Request $request): JsonResponse
@@ -244,6 +403,49 @@ class ConsultaPrataController extends Controller
                 'pending_timeout' => (bool) ($balanceResult['pending'] ?? false),
             ],
         ]);
+    }
+
+    private function loadPendingRows(int $limit, ?int $idUserScope, ?int $idEquipeScope): array
+    {
+        $query = DB::connection('sqlsrv_kinghost_vps')
+            ->table('consultas_prata.dbo.consulta_prata')
+            ->select('*')
+            ->whereRaw('LOWER(LTRIM(RTRIM([status_consulta]))) = ?', ['pendente']);
+
+        if ($idUserScope !== null) {
+            $query->where('id_user', $idUserScope);
+        }
+
+        if ($idEquipeScope !== null) {
+            $query->where('equipe_id', $idEquipeScope);
+        }
+
+        return $query
+            ->orderBy('updated_at')
+            ->orderBy('created_at')
+            ->orderBy('id_consulta_prata')
+            ->limit($limit)
+            ->get()
+            ->all();
+    }
+
+    private function pickFirstText(object $row, array $fields): string
+    {
+        foreach ($fields as $field) {
+            if (!property_exists($row, $field)) {
+                continue;
+            }
+            $value = trim((string) ($row->{$field} ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
+        }
+        return '';
+    }
+
+    private function digitsOnly(string $value): string
+    {
+        return preg_replace('/\D/', '', $value);
     }
 
     private function getPendingConsultaById(int $idConsultaPrata): ?array
