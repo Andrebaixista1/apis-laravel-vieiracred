@@ -72,6 +72,7 @@ Route::post('/consulta-v8', [ConsultaV8Controller::class, 'store']);
 Route::post('/consulta-v8/individual', [ConsultaV8Controller::class, 'storeIndividual']);
 Route::post('/consulta-v8/liberar-pendentes', [ConsultaV8Controller::class, 'releasePendingByScope']);
 Route::delete('/consulta-v8/consultas', [ConsultaV8Controller::class, 'deleteConsultasByLote']);
+Route::get('/consulta-prata/run', [ConsultaPrataController::class, 'run']);
 Route::post('/consulta-handmais', [ConsultaHandmaisController::class, 'store']);
 Route::post('/consulta-handmais/individual', [ConsultaHandmaisController::class, 'storeIndividual']);
 Route::get('/consulta-handmais/limites', [ConsultaHandmaisController::class, 'listLimites']);

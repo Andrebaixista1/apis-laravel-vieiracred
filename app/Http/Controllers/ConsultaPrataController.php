@@ -18,6 +18,11 @@ class ConsultaPrataController extends Controller
     private const AUTHORIZATION_TERM_URL = 'https://api.bancoprata.com.br/v1/private-payroll/authorization_term';
     private const BALANCE_URL = 'https://api.bancoprata.com.br/v1/private-payroll/balance';
 
+    public function run(Request $request): JsonResponse
+    {
+        return $this->consultar($request);
+    }
+
     public function consultar(Request $request): JsonResponse
     {
         $data = $request->validate([
